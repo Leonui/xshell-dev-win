@@ -7,7 +7,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw } from "lucide-react";
+import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Copy, ClipboardPaste, TextSelect } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
 import "@xterm/xterm/css/xterm.css";
@@ -148,6 +148,12 @@ interface TerminalTabProps {
   onBranchSwitch: (tabId: string, newSessionId: string, newTitle: string) => void;
 }
 
+interface TerminalContextMenuState {
+  x: number;
+  y: number;
+  selection: string;
+}
+
 // Compact USD formatter for the header strip — keeps the value tight on narrow terminals
 // without dropping precision for small totals (≪ $1).
 function formatCost(usd: number): string {
@@ -190,6 +196,10 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
+  // `shellMode: "claude"` is the persisted legacy name for every agent-backed terminal.
+  // Agent-specific behavior must use `tab.agent`, not this mode flag.
+  const isAgentSession = (tab.shellMode || "claude") !== "raw";
+  const isClaudeAgent = isAgentSession && (tab.agent || "claude") === "claude";
   const [_error, setError] = useState<string | null>(null);
   const tabRef = useRef(tab);
   // Loading state: true from spawn until the PTY emits its first byte. That window covers
@@ -197,13 +207,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // is ready. Universal: works for fresh, --resume, and raw shells.
   const [isInitializing, setIsInitializing] = useState(true);
   const sawFirstOutputRef = useRef(false);
+  const [terminalContextMenu, setTerminalContextMenu] = useState<TerminalContextMenuState | null>(null);
 
   const [showGitPanel, setShowGitPanel] = useState(false);
   // The git and file-explorer panels share one slot on the right — only one is open at a
   // time (VS Code-style). Width is shared too, so resizing one carries over to the other.
-  // Initial open is driven only by the "open file explorer on start" setting (claude tabs);
+  // Initial open is driven only by the "open file explorer on start" setting (agent tabs);
   // the git panel never auto-opens — it opens when the user clicks its activity-bar button.
-  const openExplorerByDefault = fileExplorerOnStart && (tab.shellMode || "claude") === "claude";
+  const openExplorerByDefault = fileExplorerOnStart && isAgentSession;
   const [showFilePanel, setShowFilePanel] = useState(openExplorerByDefault);
   // Once the file explorer is opened we keep it mounted (just hidden) for the life of the tab,
   // so its browsed path + expansion state survive toggling the panel and switching tabs —
@@ -259,6 +270,64 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
   const showTt = useCallback((text: string, el: HTMLElement) => setTooltip({ text, rect: el.getBoundingClientRect() }), []);
   const hideTt = useCallback(() => setTooltip(null), []);
+
+  const focusTerminal = useCallback(() => {
+    requestAnimationFrame(() => terminalRef.current?.focus());
+  }, []);
+
+  const copyTerminalSelection = useCallback((selection?: string) => {
+    const text = selection ?? terminalRef.current?.getSelection() ?? "";
+    if (!text) return;
+    try { navigator.clipboard.writeText(text).catch(() => {}); } catch (_) {}
+  }, []);
+
+  const pasteTerminalClipboard = useCallback(async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) terminalRef.current?.paste(text);
+    } catch (_) {}
+  }, []);
+
+  const openTerminalContextMenu = useCallback((ev: React.MouseEvent<HTMLDivElement>) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const rect = containerRef.current?.getBoundingClientRect();
+    const keyboardTriggered = ev.clientX === 0 && ev.clientY === 0;
+    setTerminalContextMenu({
+      x: keyboardTriggered && rect ? rect.left + Math.min(32, rect.width / 2) : ev.clientX,
+      y: keyboardTriggered && rect ? rect.top + Math.min(32, rect.height / 2) : ev.clientY,
+      selection: terminalRef.current?.getSelection() ?? "",
+    });
+  }, []);
+
+  const handleTerminalContextMenuKeyDown = useCallback((ev: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
+    const items = Array.from(ev.currentTarget.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)'));
+    if (!items.length) return;
+    ev.preventDefault();
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    let next = 0;
+    if (ev.key === "End") next = items.length - 1;
+    else if (ev.key === "ArrowUp") next = current <= 0 ? items.length - 1 : current - 1;
+    else if (ev.key === "ArrowDown") next = current < 0 || current === items.length - 1 ? 0 : current + 1;
+    items[next].focus();
+  }, []);
+
+  useEffect(() => {
+    if (!terminalContextMenu) return;
+    const close = () => setTerminalContextMenu(null);
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") { close(); focusTerminal(); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+    };
+  }, [terminalContextMenu, focusTerminal]);
 
   // Delayed-tooltip variant for git-change rows — like the file explorer, it waits ~1s so the
   // hint ("Click to show diff") doesn't flicker as the cursor scans the list.
@@ -349,19 +418,33 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       } catch (_) { /* WebGL unavailable — DOM renderer takes over automatically */ }
     }
 
-    // Intercept Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0 for zoom, and Ctrl+V for paste
-    // (Windows Terminal convention — the terminal would otherwise swallow Ctrl+V as ^V).
+    // Terminal-native clipboard conventions: Ctrl+Shift+C always copies, Ctrl+C copies only
+    // when text is selected (otherwise it remains SIGINT), and Ctrl+V / Ctrl+Shift+V paste.
+    // Terminal.paste() normalizes line endings and honors bracketed-paste mode for agent TUIs.
     term.attachCustomKeyEventHandler((ev) => {
-      if (!ev.ctrlKey || ev.type !== "keydown") return true;
-      if (ev.key === "+" || ev.key === "=") { applyFontSize(fontSizeRef.current + 1); ev.preventDefault(); return false; }
-      if (ev.key === "-" || ev.key === "_") { applyFontSize(fontSizeRef.current - 1); ev.preventDefault(); return false; }
-      if (ev.key === "0") { applyFontSize(defaultFontSizeRef.current); ev.preventDefault(); return false; }
-      // Ctrl+V (but not Ctrl+Shift+V — that stays for xterm's default / bracketed escape).
-      if (!ev.shiftKey && !ev.altKey && ev.key.toLowerCase() === "v") {
+      if (ev.type !== "keydown") return true;
+      const key = ev.key.toLowerCase();
+
+      // Shift+Insert is the long-standing terminal paste shortcut.
+      if (ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey && key === "insert") {
         ev.preventDefault();
-        navigator.clipboard.readText().then((text) => {
-          if (text) invoke("write_terminal", { id: tabRef.current.id, data: text }).catch(() => {});
-        }).catch(() => {});
+        void pasteTerminalClipboard();
+        return false;
+      }
+
+      const primaryModifier = ev.ctrlKey || ev.metaKey;
+      if (!primaryModifier || ev.altKey) return true;
+      if (ev.ctrlKey && (ev.key === "+" || ev.key === "=")) { applyFontSize(fontSizeRef.current + 1); ev.preventDefault(); return false; }
+      if (ev.ctrlKey && (ev.key === "-" || ev.key === "_")) { applyFontSize(fontSizeRef.current - 1); ev.preventDefault(); return false; }
+      if (ev.ctrlKey && ev.key === "0") { applyFontSize(defaultFontSizeRef.current); ev.preventDefault(); return false; }
+      if ((key === "c" && (ev.shiftKey || term.hasSelection())) || (key === "insert" && term.hasSelection())) {
+        ev.preventDefault();
+        copyTerminalSelection();
+        return false;
+      }
+      if (key === "v") {
+        ev.preventDefault();
+        void pasteTerminalClipboard();
         return false;
       }
       return true;
@@ -419,22 +502,6 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       if (entries[0]?.isIntersecting) requestAnimationFrame(() => { fitAddon.fit(); term.focus(); });
     });
     intersectionObserver.observe(containerRef.current);
-
-    // Right-click = paste clipboard into terminal (like Windows Terminal / gnome-terminal).
-    // Claude Code handles right-click paste itself (it enables mouse reporting, so xterm
-    // forwards the click and Claude reads the clipboard — including images). Doing our own
-    // write_terminal too would paste twice, so we only paste manually for raw shells, which
-    // don't paste on right-click on their own. We still preventDefault everywhere to suppress
-    // the browser context menu.
-    const onContextMenu = async (ev: MouseEvent) => {
-      ev.preventDefault();
-      if ((tabRef.current.shellMode || "claude") === "claude") return;
-      try {
-        const text = await navigator.clipboard.readText();
-        if (text) invoke("write_terminal", { id: tabRef.current.id, data: text }).catch(() => {});
-      } catch (_) {}
-    };
-    containerRef.current.addEventListener("contextmenu", onContextMenu);
 
     async function spawnBackend(term: Terminal, _fitAddon: FitAddon) {
       const id = tabRef.current.id;
@@ -505,7 +572,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         sawFirstOutputRef.current = true;
         setIsInitializing(false);
         term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
-        if ((tabRef.current.shellMode || "claude") === "claude") {
+        if ((tabRef.current.shellMode || "claude") !== "raw") {
           term.write(`\x1b[90mMake sure '${AGENTS[tabRef.current.agent || "claude"].binary}' is installed and available in your PATH.\x1b[0m\r\n`);
         }
       }
@@ -526,7 +593,6 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     return () => {
       resizeObserver.disconnect();
       intersectionObserver.disconnect();
-      containerEl?.removeEventListener("contextmenu", onContextMenu);
       containerEl?.removeEventListener("wheel", onWheel);
       if ((term as any)._cleanup) (term as any)._cleanup();
       // Dispose the WebGL addon explicitly before the terminal — its docs note that an
@@ -720,7 +786,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // filter also excludes any jsonl that existed when we attached (e.g. user resumed the
   // parent in another tab; that bumps mtime but the file is pre-existing → correctly ignored).
   const checkBranch = useCallback(async () => {
-    if (!tab.projectPath || !tab.sessionId || (tab.shellMode || "claude") !== "claude") return;
+    if (!tab.projectPath || !tab.sessionId || !isClaudeAgent) return;
     if (!knownSeededRef.current) return;
     try {
       const info = await invoke<BranchInfo | null>("detect_session_branch", {
@@ -739,13 +805,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       setBranchNotice({ oldTitle, newTitle: info.title });
       branchNoticeTimerRef.current = window.setTimeout(() => setBranchNotice(null), 6000);
     } catch (_) {}
-  }, [tab.projectPath, tab.sessionId, tab.shellMode, tab.id, tab.title, onBranchSwitch]);
+  }, [tab.projectPath, tab.sessionId, isClaudeAgent, tab.id, tab.title, onBranchSwitch]);
 
   // Re-seed whenever the tab's sessionId changes (initial attach, or after a branch-switch).
   useEffect(() => {
     knownSeededRef.current = false;
+    if (!isClaudeAgent) return;
     seedKnownSessionIds();
-  }, [tab.sessionId, seedKnownSessionIds]);
+  }, [tab.sessionId, isClaudeAgent, seedKnownSessionIds]);
 
   // Clean up notice timers on unmount.
   useEffect(() => () => {
@@ -784,43 +851,41 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     renameNoticeTimerRef.current = window.setTimeout(() => setRenameNotice(null), 6000);
   }, [tab.title, tab.sessionId]);
 
-  // The git panel is paired with the Claude experience (matches /branch + /rename detection,
-  // commit history alongside session history, etc.). Raw shells are intentionally minimal —
+  // The git panel is paired with agent sessions (commit history alongside session history,
+  // etc.). Raw shells are intentionally minimal —
   // no git panel, no polling, no header indicator.
-  const isClaudeSession = (tab.shellMode || "claude") === "claude";
-
-  // One-shot fetch when a Claude session attaches, so the activity-bar icon has data even
+  // One-shot fetch when an agent session attaches, so the activity-bar icon has data even
   // before the user opens the panel. Fires regardless of polling mode.
   useEffect(() => {
-    if (!tab.projectPath || !isClaudeSession) return;
+    if (!tab.projectPath || !isAgentSession) return;
     fetchGitStatus();
-  }, [tab.projectPath, isClaudeSession, tab.sessionId, fetchGitStatus]);
+  }, [tab.projectPath, isAgentSession, tab.sessionId, fetchGitStatus]);
 
   // Continuous polling. In lazy mode (default), polling runs only while the panel is open —
   // so a closed panel is essentially free. In eager mode, it runs whenever the tab is the
   // active one. Raw shells skip this entirely; they don't have git chrome anywhere.
   useEffect(() => {
-    if (!isActive || !tab.projectPath || !isClaudeSession) return;
+    if (!isActive || !tab.projectPath || !isAgentSession) return;
     const shouldPoll = gitLazyPolling ? showGitPanel : true;
     if (!shouldPoll) return;
     fetchGitStatus();
     const interval = setInterval(fetchGitStatus, 3000);
     return () => clearInterval(interval);
-  }, [isActive, tab.projectPath, gitLazyPolling, showGitPanel, isClaudeSession, fetchGitStatus]);
+  }, [isActive, tab.projectPath, gitLazyPolling, showGitPanel, isAgentSession, fetchGitStatus]);
 
   // Drop stale stats whenever the underlying session changes (raw shell / no sessionId /
   // session swap via /branch). Polling itself only runs while active — but we keep the
   // last-seen values in state across activate/deactivate so switching tabs doesn't flash
   // an empty strip for the 4s until the next poll lands.
   useEffect(() => {
-    if (!isClaudeSession || !tab.sessionId || !projectEncodedName) setSessionStats(null);
-  }, [isClaudeSession, tab.sessionId, projectEncodedName]);
+    if (!isAgentSession || !tab.sessionId || !projectEncodedName) setSessionStats(null);
+  }, [isAgentSession, tab.sessionId, projectEncodedName]);
 
   // Poll session stats (cost, context tokens) while active. Cost ticks up as claude works,
   // so 4s feels live without hammering disk; the underlying Rust cache short-circuits when
   // mtimes haven't changed. Skipped entirely for raw shells and tabs without a sessionId.
   useEffect(() => {
-    if (!isActive || !isClaudeSession || !tab.sessionId || !projectEncodedName) return;
+    if (!isActive || !isAgentSession || !tab.sessionId || !projectEncodedName) return;
     let cancelled = false;
     const fetchStats = async () => {
       try {
@@ -833,7 +898,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     fetchStats();
     const interval = setInterval(fetchStats, 4000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [isActive, isClaudeSession, tab.sessionId, projectEncodedName]);
+  }, [isActive, isAgentSession, tab.sessionId, projectEncodedName]);
 
   // Poll every 5s, but only while this tab is the active (focused) one. Background tabs
   // don't scan — the user can't /branch in a tab they aren't looking at. On each tick we
@@ -842,11 +907,11 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   useEffect(() => {
     if (!isActive) return;
     if (!tab.projectPath || !tab.sessionId) return;
-    if ((tab.shellMode || "claude") !== "claude") return;
+    if (!isClaudeAgent) return;
     checkBranch();
     const interval = window.setInterval(checkBranch, 5000);
     return () => window.clearInterval(interval);
-  }, [isActive, tab.projectPath, tab.sessionId, tab.shellMode, checkBranch]);
+  }, [isActive, tab.projectPath, tab.sessionId, isClaudeAgent, checkBranch]);
 
   // Refresh commit history whenever the History tab is shown, and when `ahead` changes
   // (likely a new local commit). Cheap enough to just re-fetch alongside normal polls too.
@@ -936,7 +1001,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // numbers for this session AND the user hasn't opted out via the Agents tab toggle.
   // Without authoritative stats the cost would always be $0 and the bar empty — falls back
   // to the plain path in that case (or whenever the user has explicitly disabled the strip).
-  const showStatsStrip = isClaudeSession && showTerminalHeaderStats && sessionStats?.is_authoritative_stats && sessionStats.context_limit > 0;
+  const showStatsStrip = isAgentSession && showTerminalHeaderStats && sessionStats?.is_authoritative_stats && sessionStats.context_limit > 0;
   const ctxPct = showStatsStrip ? Math.min(100, (sessionStats!.context_tokens / sessionStats!.context_limit) * 100) : 0;
 
   return (
@@ -992,6 +1057,12 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           className="terminal-container"
           ref={containerRef}
           style={{ background: paletteFor(theme, terminalBgColor).background }}
+          onContextMenu={openTerminalContextMenu}
+          onMouseDownCapture={(e) => {
+            // Stop right-button mouse reporting before xterm forwards it to an agent TUI.
+            // The subsequent contextmenu event opens xshell's clipboard menu instead.
+            if (e.button === 2) { e.preventDefault(); e.stopPropagation(); }
+          }}
           onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_PATH_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
           onDrop={(e) => {
             const p = e.dataTransfer.getData(DRAG_PATH_MIME) || e.dataTransfer.getData("text/plain");
@@ -1005,11 +1076,11 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           {isInitializing && (
             <div className="terminal-loading-overlay">
               <div className="spinner" />
-              <span>{isClaudeSession ? `Starting ${AGENTS[tab.agent || "claude"].label}…` : "Starting shell…"}</span>
+              <span>{isAgentSession ? `Starting ${AGENTS[tab.agent || "claude"].label}…` : "Starting shell…"}</span>
             </div>
           )}
         </div>
-        {isClaudeSession && showGitPanel && gitStatus?.is_repo && (
+        {isAgentSession && showGitPanel && gitStatus?.is_repo && (
           <>
             <div className="terminal-splitter" onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
             <div className="terminal-side-panel" style={{ width: gitPanelWidth }}>
@@ -1067,7 +1138,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             </div>
           </>
         )}
-        {isClaudeSession && tab.projectPath && fileExplorerMounted && (
+        {isAgentSession && tab.projectPath && fileExplorerMounted && (
           // Kept mounted once opened (toggled with `display`, not unmounted) so the explorer's
           // path + expansion state persist across panel toggles and tab switches.
           <>
@@ -1077,11 +1148,11 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             </div>
           </>
         )}
-        {/* Activity bar — claude-only, persistent. Hosts the git + file-explorer toggles; the
+        {/* Activity bar — agent-only, persistent. Hosts the git + file-explorer toggles; the
             two panels share one slot (opening one closes the other). The git button is
             disabled-but-visible when the cwd isn't a repo, so the bar's column doesn't jump
             in/out as the user switches tabs. */}
-        {isClaudeSession && (
+        {isAgentSession && (
           <div className="terminal-activity-bar">
             {(() => {
               const gitDisabled = !gitStatus?.is_repo;
@@ -1113,6 +1184,68 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           </div>
         )}
       </div>
+      {terminalContextMenu && (
+        <>
+          <div
+            className="file-ctx-backdrop"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => { setTerminalContextMenu(null); focusTerminal(); }}
+            onContextMenu={(e) => { e.preventDefault(); setTerminalContextMenu(null); focusTerminal(); }}
+          />
+          <div
+            className="file-ctx-menu terminal-ctx-menu"
+            role="menu"
+            aria-label="Terminal clipboard actions"
+            style={{
+              left: Math.max(4, Math.min(terminalContextMenu.x, window.innerWidth - 228)),
+              top: Math.max(4, Math.min(terminalContextMenu.y, window.innerHeight - 132)),
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+            onKeyDown={handleTerminalContextMenuKeyDown}
+          >
+            <button
+              type="button"
+              className="file-ctx-item terminal-ctx-item"
+              role="menuitem"
+              disabled={!terminalContextMenu.selection}
+              autoFocus={Boolean(terminalContextMenu.selection)}
+              onClick={() => {
+                copyTerminalSelection(terminalContextMenu.selection);
+                setTerminalContextMenu(null);
+                focusTerminal();
+              }}
+            >
+              <Copy size={13} /><span>Copy</span><span className="terminal-ctx-shortcut">Ctrl+Shift+C</span>
+            </button>
+            <button
+              type="button"
+              className="file-ctx-item terminal-ctx-item"
+              role="menuitem"
+              autoFocus={!terminalContextMenu.selection}
+              onClick={() => {
+                void pasteTerminalClipboard();
+                setTerminalContextMenu(null);
+                focusTerminal();
+              }}
+            >
+              <ClipboardPaste size={13} /><span>Paste</span><span className="terminal-ctx-shortcut">Ctrl+V</span>
+            </button>
+            <div className="terminal-ctx-separator" />
+            <button
+              type="button"
+              className="file-ctx-item terminal-ctx-item"
+              role="menuitem"
+              onClick={() => {
+                terminalRef.current?.selectAll();
+                setTerminalContextMenu(null);
+                focusTerminal();
+              }}
+            >
+              <TextSelect size={13} /><span>Select All</span>
+            </button>
+          </div>
+        </>
+      )}
       {tooltip && <TerminalTooltip text={tooltip.text} rect={tooltip.rect} />}
       {gitCtx && (
         <>

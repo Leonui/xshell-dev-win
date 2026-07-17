@@ -844,6 +844,16 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .file-ctx-item.file-ctx-danger svg, .file-ctx-item.file-ctx-danger:hover svg { color: #d97757; }
 .file-ctx-confirm { padding: 7px 10px; max-width: 220px; font-size: 11px; line-height: 1.4; color: var(--text-secondary); white-space: normal; }
 
+/* Terminal clipboard menu extends the shared context-menu surface with shortcut hints. */
+.terminal-ctx-menu { min-width: 220px; }
+.terminal-ctx-item { width: 100%; }
+.terminal-ctx-item:disabled,
+.terminal-ctx-item:disabled:hover { background: transparent; color: var(--text-muted); cursor: default; opacity: 0.55; }
+.terminal-ctx-item:disabled svg,
+.terminal-ctx-item:disabled:hover svg { color: var(--text-muted); }
+.terminal-ctx-shortcut { margin-left: auto; padding-left: 18px; color: var(--text-muted); font-family: var(--font-mono); font-size: 10px; }
+.terminal-ctx-separator { height: 1px; margin: 3px 6px; background: var(--border-subtle); }
+
 /* Change-blink: fires when a file first appears in status or its state changes.
    The keyframes reach peak tint quickly, then fade out so later rows settle calmly. */
 @keyframes gitFileBlink {

@@ -287,7 +287,7 @@ export interface Tab {
   projectPath?: string;
   projectName?: string;
   encodedName?: string;
-  shellMode?: 'claude' | 'raw'; // default 'claude'. 'raw' = plain shell, no claude command
+  shellMode?: 'claude' | 'raw'; // legacy 'claude' value means any agent-backed terminal; 'raw' is a plain shell
   shellId?: string; // e.g. 'powershell', 'cmd', 'bash', 'zsh' — when shellMode='raw'
   agent?: 'claude' | 'codex' | 'cursor' | 'opencode' | 'antigravity'; // which agent CLI the tab hosts; default 'claude'
   groupId?: string; // when set, the tab is a member of a group (not standalone in the tab bar)

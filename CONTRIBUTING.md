@@ -54,6 +54,24 @@ npm run tauri build
 
 Installers land in `src-tauri/target/release/bundle/`.
 
+### Windows PowerShell helpers
+
+On a new Windows machine, double-click `windows\setup-windows.cmd`. It requests Administrator permission, installs the required Node.js, MSVC, WebView2, and Rust toolchains, validates them, and builds xshell. The window stays open so you can read any errors. You can safely run it again after a reboot or partial installation.
+
+If you are building on Windows and want a checked PowerShell path instead of typing the raw commands:
+
+```powershell
+.\windows\check-windows-build-env.ps1
+.\windows\build-windows.ps1 -InstallNodeModules
+```
+
+Useful flags:
+
+- `-Clean` removes `dist/` and `src-tauri/target/` before building
+- `-SkipEnvCheck` skips the prerequisite validation step
+
+When `TAURI_SIGNING_PRIVATE_KEY` is not set, the Windows build helper creates the portable EXE, MSI, and NSIS installer without updater artifacts. Release builds keep updater artifacts enabled and use the signing key configured in GitHub Actions.
+
 ## Project structure
 
 ```
