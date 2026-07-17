@@ -25,9 +25,7 @@ if (-not $npmPath) {
 
 if (-not $SkipEnvCheck) {
   & $envCheckScript
-  if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-  }
+  if (-not $?) { throw "Windows build environment check failed." }
 }
 
 Push-Location $repoRoot

@@ -48,6 +48,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: rustfmt, clippy
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
@@ -58,7 +59,22 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build and publish (Tauri)
+      - name: Frontend tests
+        run: npm test -- --run
+
+      - name: Frontend production build
+        run: npm run build
+
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build, verify, and publish (Tauri)
         id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -67,6 +83,8 @@ jobs:
           # Keep this defined even for a passwordless key so the signer does not prompt.
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          # The wrapper verifies the exact updater artifacts before tauri-action can upload them.
+          tauriScript: npm run tauri:verified --
           tagName: 'v__VERSION__'
           releaseName: 'xshell v__VERSION__'
           releaseBody: |
@@ -78,6 +96,24 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Assert signed Windows package set
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $required = @(
+            Get-Item 'src-tauri/target/release/xshell.exe' -ErrorAction Stop
+            Get-ChildItem 'src-tauri/target/release/bundle/msi' -Filter '*.msi' -File | Select-Object -First 1
+            Get-ChildItem 'src-tauri/target/release/bundle/msi' -Filter '*.msi.sig' -File | Select-Object -First 1
+            Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' -File | Select-Object -First 1
+            Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe.sig' -File | Select-Object -First 1
+          )
+          if ($required.Count -ne 5 -or $required -contains $null) {
+            throw 'Missing portable EXE, MSI, NSIS, or updater signature artifact.'
+          }
+          foreach ($artifact in $required) {
+            if ($artifact.Length -le 0) { throw "Empty artifact: $($artifact.FullName)" }
+          }
 
       # Upload the raw xshell.exe (portable build, no installer wrapper) so the
       # npm wrapper can fetch it directly without triggering a UAC install dialog.

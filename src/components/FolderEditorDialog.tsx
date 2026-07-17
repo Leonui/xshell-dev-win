@@ -34,7 +34,7 @@ export function FolderEditorDialog({ folder, onSave, onClose }: Props) {
 
   return (
     <div className="settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="settings-panel edit-folder-panel" ref={panelRef}>
+      <div className="settings-panel edit-folder-panel" ref={panelRef} role="dialog" aria-modal="true" aria-label="Edit folder">
         <div className="settings-header">
           <span>Edit Folder</span>
           <button className="settings-close" onClick={onClose} aria-label="Close"><X size={14} /></button>

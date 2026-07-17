@@ -114,9 +114,19 @@ xshell/
 
 ## Testing
 
-xshell does not yet have an automated test suite. Contributions to set one up — Vitest for the React side, `cargo test` for Rust — are very welcome.
+Run the automated frontend and Rust gates before opening a pull request:
 
-In the meantime, please manually test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
+```sh
+npm test -- --run
+npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+```
+
+On Windows, `windows\hard-gate.cmd` runs those checks and creates a fresh signed portable EXE, MSI, and NSIS installer. It requires `TAURI_SIGNING_PRIVATE_KEY`.
+
+Also manually test changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
 
 Manual checklist:
 

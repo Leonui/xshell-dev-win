@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "dialog:default",
+    "notification:default",
     "store:default",
     "core:event:default",
     "core:event:allow-listen",
@@ -16,6 +17,8 @@
     "core:window:allow-start-dragging",
     "core:window:allow-is-maximized",
     "core:window:allow-set-always-on-top",
+    "core:window:allow-set-badge-count",
+    "core:window:allow-set-overlay-icon",
     "updater:default",
     "process:default"
   ]

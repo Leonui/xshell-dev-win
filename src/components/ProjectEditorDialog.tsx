@@ -96,7 +96,7 @@ export function ProjectEditorDialog({ project, settings, onSave, onClose }: Prop
 
   return (
     <div className="settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="settings-panel edit-project-panel" ref={panelRef}>
+      <div className="settings-panel edit-project-panel" ref={panelRef} role="dialog" aria-modal="true" aria-label={`Edit ${project.name}`}>
         <div className="settings-header">
           <span>Edit Project</span>
           <button className="settings-close" onClick={onClose} aria-label="Close"><X size={14} /></button>

@@ -11,8 +11,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["image-png"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
 tauri-plugin-store = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
@@ -25,6 +26,13 @@ uuid = { version = "1", features = ["v4"] }
 # depend on a system libsqlite. md5: Cursor keys chat folders by md5 of the workspace cwd.
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
+
+[dev-dependencies]
+base64 = "0.22"
+minisign-verify = "0.2.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 [profile.dev]

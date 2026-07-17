@@ -31,7 +31,7 @@ export function UpdateDialog({ info, onDismiss }: Props) {
 
   return (
     <div className="md-overlay" onClick={onDismiss}>
-      <div className="md-dialog upd-dialog" onClick={e => e.stopPropagation()}>
+      <div className="md-dialog upd-dialog" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Update available">
         <div className="md-head">
           <span className="md-title">Update available</span>
           <button className="md-head-btn" onClick={onDismiss} aria-label="Close"><X size={14} /></button>

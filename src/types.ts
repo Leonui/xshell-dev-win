@@ -1,3 +1,5 @@
+import type { LaunchSpecV1 } from "./lib/windowState";
+
 export interface ProjectInfo {
   name: string;
   path: string;
@@ -294,6 +296,9 @@ export interface Tab {
   groupId?: string; // when set, the tab is a member of a group (not standalone in the tab bar)
   lastActiveAt?: number; // ms epoch — bumped whenever the tab becomes the focused leaf; drives "recent" sort in the tab search dialog
   createdAt?: number; // ms epoch at tab creation (stable, unlike lastActiveAt) — lets the title-sync link an unlinked agent tab to a session that appeared after it opened
+  launch?: LaunchSpecV1; // versioned source of truth; legacy fields above remain runtime adapters
+  pinned?: boolean; // only valid for a standalone tab; grouped entries are pinned on Group
+  requiresLaunchConfirmation?: boolean; // command tabs restored from disk never auto-run
 }
 
 // Binary layout tree for a group's split view. Leaves point at tab ids.
@@ -305,6 +310,7 @@ export interface Group {
   id: string;
   name: string;       // e.g. "Group 1"
   layout: LayoutNode;
+  pinned?: boolean;
 }
 
 export interface AppSettings {

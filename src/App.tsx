@@ -4,7 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getDefaultShellId, getShellById } from "./shells";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { AlertTriangle, X as XIcon } from "lucide-react";
+import activityOverlayUrl from "../src-tauri/icons/32x32.png?url";
+import { getAvailableShells, getDefaultShellId, getShellById } from "./shells";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { HomeView } from "./components/HomeView";
@@ -17,9 +20,59 @@ import { AgentPickerDialog } from "./components/AgentPickerDialog";
 import { AGENT_IDS, AGENTS, type AgentId } from "./agents";
 import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo, Tab, Group, LayoutNode, SidebarItem, SidebarFolder } from "./types";
 import { GroupView } from "./components/GroupView";
-import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
+import { countLeaves, collectLeafIds, insertLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { UpdateDialog } from "./components/UpdateDialog";
+import {
+  getDefaultInteractionSettings,
+  findInteractionSettingConflicts,
+  sanitizeInteractionSettings,
+  type InteractionSettings,
+} from "./lib/interactionSettings";
+import {
+  decodeWindowState,
+  closeWindowEntry,
+  closeWindowPane,
+  migrateLegacyWindowState,
+  undoLastClosed,
+  validateWindowState,
+  type ClosedRecordV1,
+  type LaunchSpecV1,
+} from "./lib/windowState";
+import {
+  createWindowState,
+  decodeRuntimeWindowState,
+  filterStartupWindowState,
+  findActiveRuntimeTab,
+  preservePendingCommandConfirmations,
+  requireConfirmationForNewCommandTabs,
+} from "./lib/runtimeWindowState";
+import {
+  captureWorkspace,
+  decodeLaunchRecipe,
+  decodeWorkspace,
+  effectiveWorkspaceForPreflight,
+  materializeLaunchRecipe,
+  materializeWorkspace,
+  preflightLaunchRecipe,
+  preflightWorkspace,
+  type LaunchRecipeV1,
+  type WorkspaceV1,
+} from "./lib/launchPlans";
+import {
+  DEFAULT_AGENT_NOTIFICATION_PREFERENCES,
+  acknowledgeTerminalActivities,
+  createTerminalActivity,
+  notificationDecision,
+  reduceTerminalActivity,
+  sanitizeAgentNotificationPreferences,
+  type ActivityByTabId,
+  type ActivityEvent,
+  type AgentNotificationPreferences,
+  type HookActivityEvent,
+} from "./lib/terminalActivity";
+
+type PolledActivityEvent = HookActivityEvent & { tabId: string };
 
 // Flatten sidebar items to an ordered list of project paths (folders expanded in place).
 // Used to derive `savedPaths` for downstream code that doesn't care about folders.
@@ -71,6 +124,65 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
   return <div className="drop-zone-preview" style={box} />;
 }
 
+function describePlanIssues(issues: readonly { message: string }[]): string {
+  const messages = issues.slice(0, 3).map(issue => issue.message);
+  return `${messages.join(" ")}${issues.length > messages.length ? ` (${issues.length - messages.length} more)` : ""}`;
+}
+
+function workspaceDirectories(workspace: WorkspaceV1): string[] {
+  const seen = new Set<string>();
+  for (const entry of workspace.entries) {
+    const tabs = entry.kind === "tab" ? [entry.tab] : entry.tabs;
+    for (const tab of tabs) {
+      if (tab.projectPath.trim()) seen.add(tab.projectPath);
+    }
+  }
+  return [...seen];
+}
+
+function workspaceShellIds(workspace: WorkspaceV1, fallbackShellId: string): string[] {
+  const seen = new Set<string>();
+  for (const entry of workspace.entries) {
+    const tabs = entry.kind === "tab" ? [entry.tab] : entry.tabs;
+    for (const tab of tabs) {
+      const shellId = tab.launch.kind === "shell" || tab.launch.kind === "command"
+        ? tab.launch.shellId
+        : tab.launch.hostShellId || fallbackShellId;
+      if (shellId) seen.add(shellId);
+    }
+  }
+  return [...seen];
+}
+
+interface WorkspaceCommandPreflight {
+  launch: Extract<LaunchSpecV1, { kind: "command" }>;
+  cwd: string;
+}
+
+function workspaceCommandPreflights(workspace: WorkspaceV1): WorkspaceCommandPreflight[] {
+  const launches: WorkspaceCommandPreflight[] = [];
+  for (const entry of workspace.entries) {
+    const tabs = entry.kind === "tab" ? [entry.tab] : entry.tabs;
+    for (const tab of tabs) {
+      if (tab.launch.kind === "command") launches.push({ launch: tab.launch, cwd: tab.projectPath });
+    }
+  }
+  return launches;
+}
+
+function workspaceDependencySignature(workspace: WorkspaceV1, fallbackShellId: string): string {
+  return JSON.stringify([
+    workspaceDirectories(workspace).sort(),
+    workspaceShellIds(workspace, fallbackShellId).sort(),
+    workspaceCommandPreflights(workspace),
+  ]);
+}
+
+interface WorkspaceDependencyProbe {
+  missingDirectories: string[];
+  missingShells: string[];
+}
+
 export default function App() {
   const [allProjects, setAllProjects] = useState<ProjectInfo[]>([]);
   const [savedPaths, setSavedPaths] = useState<string[]>([]);
@@ -82,7 +194,24 @@ export default function App() {
   const [userProjects, setUserProjects] = useState<ProjectInfo[]>([]);
   const [selectedProject, setSelectedProject] = useState<ProjectInfo | null>(null);
   const [tabs, setTabs] = useState<Tab[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
   const [activeTabId, setActiveTabId] = useState("home");
+  const [activeLeafByGroup, setActiveLeafByGroup] = useState<Record<string, string>>({});
+  const [interactionSettings, setInteractionSettings] = useState<InteractionSettings>(() => getDefaultInteractionSettings());
+  const [restoreUnpinnedTabs, setRestoreUnpinnedTabs] = useState(true);
+  const [closedHistory, setClosedHistory] = useState<ClosedRecordV1[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceV1[]>([]);
+  const [launchRecipes, setLaunchRecipes] = useState<LaunchRecipeV1[]>([]);
+  const [workspaceCaptureOpen, setWorkspaceCaptureOpen] = useState(false);
+  const [workspaceCaptureName, setWorkspaceCaptureName] = useState("");
+  const [appNotice, setAppNotice] = useState<string | null>(null);
+  const [activities, setActivities] = useState<ActivityByTabId>({});
+  const [notificationPreferences, setNotificationPreferences] = useState<AgentNotificationPreferences>(DEFAULT_AGENT_NOTIFICATION_PREFERENCES);
+  const [nativeNotificationPermission, setNativeNotificationPermission] = useState(false);
+  const [notificationsReady, setNotificationsReady] = useState(false);
+  const [isWindowFocused, setIsWindowFocused] = useState(true);
+  const [tabsRestored, setTabsRestored] = useState(false);
+  const groupCounterRef = useRef(1);
   const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([]);
   const [projectSessions, setProjectSessions] = useState<SessionInfo[]>([]);
   const [initialLoading, setInitialLoading] = useState(true);
@@ -179,9 +308,225 @@ export default function App() {
   const [updateDialogShown, setUpdateDialogShown] = useState(false);
   const tabsRef = useRef<Tab[]>([]);
   const activeTabIdRef = useRef<string>("home");
+  const activeLeafByGroupRef = useRef<Record<string, string>>({});
+  const closedHistoryRef = useRef<ClosedRecordV1[]>([]);
+  const groupsRef = useRef<Group[]>([]);
+  const activitiesRef = useRef<ActivityByTabId>({});
+  const planOperationRef = useRef(0);
+  const notificationPreferencesRef = useRef(notificationPreferences);
+  const nativeNotificationPermissionRef = useRef(false);
+  const notificationsReadyRef = useRef(false);
+  const windowFocusedRef = useRef(true);
 
   useEffect(() => { tabsRef.current = tabs; }, [tabs]);
   useEffect(() => { activeTabIdRef.current = activeTabId; }, [activeTabId]);
+  useEffect(() => { activeLeafByGroupRef.current = activeLeafByGroup; }, [activeLeafByGroup]);
+  useEffect(() => { closedHistoryRef.current = closedHistory; }, [closedHistory]);
+  useEffect(() => { groupsRef.current = groups; }, [groups]);
+  useEffect(() => { activitiesRef.current = activities; }, [activities]);
+  useEffect(() => { notificationPreferencesRef.current = notificationPreferences; }, [notificationPreferences]);
+  useEffect(() => { nativeNotificationPermissionRef.current = nativeNotificationPermission; }, [nativeNotificationPermission]);
+  useEffect(() => { notificationsReadyRef.current = notificationsReady; }, [notificationsReady]);
+
+  useEffect(() => {
+    if (!appNotice) return;
+    const timer = window.setTimeout(() => setAppNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [appNotice]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const appWindow = getCurrentWindow();
+    void appWindow.isFocused().then(focused => {
+      if (!cancelled) {
+        windowFocusedRef.current = focused;
+        setIsWindowFocused(focused);
+      }
+    }).catch(() => {});
+    void appWindow.onFocusChanged(({ payload }) => {
+      if (!cancelled) {
+        windowFocusedRef.current = payload;
+        setIsWindowFocused(payload);
+      }
+    }).then(dispose => { unlisten = dispose; }).catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void isPermissionGranted()
+      .then(granted => {
+        if (!cancelled) setNativeNotificationPermission(granted);
+      })
+      .catch(() => {
+        if (!cancelled) setNativeNotificationPermission(false);
+      })
+      .finally(() => {
+        if (!cancelled) setNotificationsReady(true);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleSetNotificationPreferences = useCallback((value: AgentNotificationPreferences) => {
+    setNotificationPreferences(sanitizeAgentNotificationPreferences(value));
+  }, []);
+
+  const handleRequestNotificationPermission = useCallback(async (): Promise<boolean> => {
+    try {
+      const granted = await isPermissionGranted() || await requestPermission() === "granted";
+      setNativeNotificationPermission(granted);
+      if (granted) {
+        setNotificationPreferences(previous => ({ ...previous, enabled: true }));
+      }
+      return granted;
+    } catch {
+      setNativeNotificationPermission(false);
+      return false;
+    }
+  }, []);
+
+  const handleActivityEvent = useCallback((tabId: string, event: ActivityEvent) => {
+    const tab = tabsRef.current.find(candidate => candidate.id === tabId);
+    if (!tab) return;
+    const terminalKind = (tab.shellMode || "claude") === "raw" ? "raw" : "agent";
+    const previous = activitiesRef.current[tabId] || createTerminalActivity(terminalKind, event.at);
+    const focusedLeaf = tab.groupId
+      ? activeTabIdRef.current === tab.groupId && activeLeafByGroupRef.current[tab.groupId] === tabId
+      : activeTabIdRef.current === tabId;
+    const context = {
+      isWindowFocused: windowFocusedRef.current,
+      isTargetVisible: focusedLeaf,
+      nativePermissionGranted: nativeNotificationPermissionRef.current,
+      notificationsReady: notificationsReadyRef.current,
+    };
+    const next = reduceTerminalActivity(previous, event, {
+      isAttended: context.isWindowFocused && focusedLeaf,
+    });
+    if (next === previous) return;
+
+    const updated = { ...activitiesRef.current, [tabId]: next };
+    activitiesRef.current = updated;
+    setActivities(updated);
+
+    if (notificationDecision(previous, next, event, notificationPreferencesRef.current, context) === "send") {
+      const body = next.reason === "permission"
+        ? "An agent is waiting for permission."
+        : next.reason === "agent-failed" || next.reason === "spawn-error" || next.reason === "process-exit"
+          ? "An agent session needs attention."
+          : next.reason === "input"
+            ? "An agent is waiting for input."
+            : "An agent turn completed.";
+      try {
+        sendNotification({ title: "xshell", body });
+      } catch {
+        // Tab indicators and the taskbar overlay remain authoritative when native toasts fail.
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!tabsRestored) return;
+    let cancelled = false;
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const events = await invoke<PolledActivityEvent[]>("poll_activity_events");
+        if (!cancelled) {
+          for (const { tabId, ...event } of events) {
+            handleActivityEvent(tabId, event as HookActivityEvent);
+          }
+        }
+      } catch {
+        // Hook integration is optional; PTY phases still work without the bridge.
+      } finally {
+        polling = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [tabsRestored, handleActivityEvent]);
+
+  useEffect(() => {
+    const group = groups.find(candidate => candidate.id === activeTabId);
+    const leafId = group
+      ? activeLeafByGroup[group.id] || collectLeafIds(group.layout)[0]
+      : tabs.some(tab => tab.id === activeTabId) ? activeTabId : null;
+    if (!leafId) return;
+    const acknowledged = acknowledgeTerminalActivities(activitiesRef.current, [leafId]);
+    if (acknowledged !== activitiesRef.current) {
+      activitiesRef.current = acknowledged;
+      setActivities(acknowledged);
+    }
+  }, [activeTabId, activeLeafByGroup, groups, tabs, isWindowFocused]);
+
+  useEffect(() => {
+    const liveIds = new Set(tabs.map(tab => tab.id));
+    const entries = Object.entries(activitiesRef.current).filter(([id]) => liveIds.has(id));
+    if (entries.length === Object.keys(activitiesRef.current).length) return;
+    const next = Object.fromEntries(entries);
+    activitiesRef.current = next;
+    setActivities(next);
+  }, [tabs]);
+
+  const unreadActivityCount = Object.values(activities).filter(activity => activity.unread).length;
+  const overlayBytesRef = useRef<Uint8Array | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const appWindow = getCurrentWindow();
+    if (unreadActivityCount === 0) {
+      void appWindow.setOverlayIcon(undefined).catch(() => {});
+      void appWindow.setBadgeCount(undefined).catch(() => {});
+      return () => { cancelled = true; };
+    }
+    void (async () => {
+      try {
+        if (!overlayBytesRef.current) {
+          const response = await fetch(activityOverlayUrl);
+          if (!response.ok) throw new Error("overlay icon unavailable");
+          overlayBytesRef.current = new Uint8Array(await response.arrayBuffer());
+        }
+        if (!cancelled) await appWindow.setOverlayIcon(overlayBytesRef.current);
+      } catch {
+        // Overlay support is Windows-only; other platforms use their native badge count.
+      }
+      if (!cancelled) void appWindow.setBadgeCount(unreadActivityCount).catch(() => {});
+    })();
+    return () => { cancelled = true; };
+  }, [unreadActivityCount]);
+
+  const applyWindowState = useCallback((
+    state: ReturnType<typeof createWindowState>,
+    options: { confirmNewCommands?: boolean } = {},
+  ) => {
+    const decoded = decodeRuntimeWindowState(state, { confirmCommands: false });
+    const gated = options.confirmNewCommands
+      ? requireConfirmationForNewCommandTabs(decoded, tabsRef.current)
+      : decoded;
+    const runtime = preservePendingCommandConfirmations(
+      gated,
+      tabsRef.current,
+    );
+    setTabs(runtime.tabs);
+    setGroups(runtime.groups);
+    setActiveTabId(runtime.activeEntryId);
+    setActiveLeafByGroup(runtime.activeLeafByGroup);
+  }, []);
+
+  const handleCommandLaunchConfirmed = useCallback((tabId: string) => {
+    setTabs(previous => previous.map(tab => tab.id === tabId
+      ? { ...tab, requiresLaunchConfirmation: false }
+      : tab));
+  }, []);
 
   // Suppress the WebView's native right-click menu (Back / Reload / Save / Print) app-wide —
   // it's never useful in a desktop app and collides with our own context menus. Still allowed
@@ -197,7 +542,6 @@ export default function App() {
   }, []);
 
   // ── Initial load ──────────────────────────────────────────────────
-  const [tabsRestored, setTabsRestored] = useState(false);
   useEffect(() => {
     (async () => {
       try {
@@ -232,6 +576,34 @@ export default function App() {
           store.get<boolean>("rate_limit_in_sidebar_codex"),
           store.get<boolean>("session_row_metrics_opencode"),
         ]);
+        const [storedWindowState, storedInteractionSettings, storedRestoreUnpinned, storedWorkspaces, storedLaunchRecipes, storedNotificationPreferences] = await Promise.all([
+          store.get<unknown>("window_state_v1"),
+          store.get<unknown>("interaction_settings_v1"),
+          store.get<boolean>("restore_unpinned_tabs"),
+          store.get<unknown[]>("workspaces_v1"),
+          store.get<unknown[]>("launch_recipes_v1"),
+          store.get<unknown>("agent_notification_preferences_v1"),
+        ]);
+        setInteractionSettings(sanitizeInteractionSettings(storedInteractionSettings));
+        setNotificationPreferences(sanitizeAgentNotificationPreferences(storedNotificationPreferences));
+        const shouldRestoreUnpinned = typeof storedRestoreUnpinned === "boolean" ? storedRestoreUnpinned : true;
+        setRestoreUnpinnedTabs(shouldRestoreUnpinned);
+        if (Array.isArray(storedWorkspaces)) {
+          const valid: WorkspaceV1[] = [];
+          for (const value of storedWorkspaces) {
+            const decoded = decodeWorkspace(value);
+            if (decoded.ok) valid.push(decoded.value);
+          }
+          setWorkspaces(valid);
+        }
+        if (Array.isArray(storedLaunchRecipes)) {
+          const valid: LaunchRecipeV1[] = [];
+          for (const value of storedLaunchRecipes) {
+            const decoded = decodeLaunchRecipe(value);
+            if (decoded.ok) valid.push(decoded.value);
+          }
+          setLaunchRecipes(valid);
+        }
         // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
         // from the flat `project_paths` list by wrapping each path in a project item.
         let layout: SidebarItem[] = [];
@@ -269,32 +641,22 @@ export default function App() {
         if (typeof rowMetricsCodex === "boolean") setShowSessionRowMetricsCodex(rowMetricsCodex);
         if (typeof rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(rlSidebarCodex);
         if (typeof rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(rowMetricsOpencode);
-        // Restore only tabs that have a real sessionId (not abandoned "New Chat" tabs)
-        if (savedTabs?.length) {
-          const restorable = savedTabs.filter(t => t.sessionId && t.projectPath);
-          if (restorable.length) {
-            // First, filter groups: keep only those whose leaves are all restorable.
-            const restoredIds = new Set(restorable.map(t => t.id));
-            const keptGroups: Group[] = [];
-            if (savedGroups?.length) {
-              for (const g of savedGroups) {
-                const leaves = collectLeafIds(g.layout);
-                if (leaves.length >= 2 && leaves.every(id => restoredIds.has(id))) keptGroups.push(g);
-              }
-            }
-            const validGroupIds = new Set(keptGroups.map(g => g.id));
-            // Then, scrub any orphaned groupId off a tab — a leftover from an earlier bug
-            // where tabs kept a groupId pointing at a group that no longer exists.
-            const scrubbed = restorable.map(t => (t.groupId && !validGroupIds.has(t.groupId)) ? { ...t, groupId: undefined } : t);
-            setTabs(scrubbed);
-            setGroups(keptGroups);
-            let maxN = 0;
-            for (const g of keptGroups) {
-              const m = /^Group\s+(\d+)$/.exec(g.name);
-              if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
-            }
-            groupCounterRef.current = maxN + 1;
+        const decodedWindow = storedWindowState === undefined
+          ? migrateLegacyWindowState({ open_tabs: savedTabs || [], open_groups: savedGroups || [] })
+          : decodeWindowState(storedWindowState);
+        if (decodedWindow.ok) {
+          const startupState = filterStartupWindowState(decodedWindow.value, shouldRestoreUnpinned);
+          const runtime = decodeRuntimeWindowState(startupState);
+          setTabs(runtime.tabs);
+          setGroups(runtime.groups);
+          setActiveTabId(runtime.activeEntryId);
+          setActiveLeafByGroup(runtime.activeLeafByGroup);
+          let maxN = 0;
+          for (const group of runtime.groups) {
+            const match = /^Group\s+(\d+)$/.exec(group.name);
+            if (match) maxN = Math.max(maxN, parseInt(match[1], 10));
           }
+          groupCounterRef.current = maxN + 1;
         }
       } catch (_) {}
       setTabsRestored(true);
@@ -345,17 +707,6 @@ export default function App() {
       await store.set("last_seen_update_version", v);
     } catch (_) {}
   }, [updateInfo.latestVersion]);
-
-  // ── Persist tabs whenever they change (after initial restore) ─────
-  useEffect(() => {
-    if (!tabsRestored) return;
-    (async () => {
-      try {
-        const store = await load("settings.json", { defaults: {}, autoSave: true });
-        await store.set("open_tabs", tabs);
-      } catch (_) {}
-    })();
-  }, [tabs, tabsRestored]);
 
   // ── Derive user projects ──────────────────────────────────────────
   useEffect(() => {
@@ -731,27 +1082,36 @@ export default function App() {
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(new Set());
 
   const handleCloseTab = useCallback((id: string) => {
-    // Group close: drop the group entry + all tabs that belong to it.
-    const group = groupsRef.current.find(g => g.id === id);
-    if (group) {
-      const memberIds = collectLeafIds(group.layout);
-      if (activeTabId === id) setActiveTabId("home");
-      setGroups(prev => prev.filter(g => g.id !== id));
-      setTabs(prev => prev.filter(t => !memberIds.includes(t.id)));
+    const current = createWindowState(
+      tabsRef.current,
+      groupsRef.current,
+      activeTabIdRef.current,
+      activeLeafByGroupRef.current,
+    );
+    const result = closeWindowEntry(current, closedHistoryRef.current, id);
+    if (!result.ok) {
+      setAppNotice(result.message);
       return;
     }
-    // Standalone tab close (existing animated path).
-    setClosingTabIds(prev => new Set(prev).add(id));
-    if (activeTabId === id) {
-      const idx = tabsRef.current.findIndex(t => t.id === id);
-      const remaining = tabsRef.current.filter(t => t.id !== id);
-      setActiveTabId(remaining.length > 0 ? remaining[Math.min(idx, remaining.length - 1)]?.id || "home" : "home");
+    setClosedHistory(result.history);
+    applyWindowState(result.state);
+  }, [applyWindowState]);
+
+  const handleReopenClosed = useCallback(() => {
+    const current = createWindowState(
+      tabsRef.current,
+      groupsRef.current,
+      activeTabIdRef.current,
+      activeLeafByGroupRef.current,
+    );
+    const result = undoLastClosed(current, closedHistoryRef.current);
+    if (!result.ok) {
+      if (result.code !== "empty_history") setAppNotice(result.message);
+      return;
     }
-    setTimeout(() => {
-      setTabs(prev => prev.filter(t => t.id !== id));
-      setClosingTabIds(prev => { const next = new Set(prev); next.delete(id); return next; });
-    }, 180);
-  }, [activeTabId]);
+    setClosedHistory(result.history);
+    applyWindowState(result.state, { confirmNewCommands: true });
+  }, [applyWindowState]);
 
   const handleReorderProjects = useCallback(async (newPaths: string[]) => {
     await persistPaths(newPaths);
@@ -775,36 +1135,50 @@ export default function App() {
   }
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const showSettings = activeTabId === "settings";
-  const activeTab = tabs.find(t => t.id === activeTabId);
+  const activeTab = findActiveRuntimeTab(tabs, groups, activeTabId, activeLeafByGroup);
   const activeTabProjectPath = activeTab?.projectPath || null;
 
   // ── Groups (multi-pane split view) ────────────────────────────
   // A Group bundles up to 8 tabs into one "entry" in the tab bar, displaying them
   // in a binary-tree split layout. A tab is either standalone OR inside one group.
   const MAX_GROUP_LEAVES = 8;
-  const [groups, setGroups] = useState<Group[]>([]);
   const showHome = !showSettings && !tabs.find(t => t.id === activeTabId) && !groups.find(g => g.id === activeTabId);
 
-  // Persist groups whenever they change (after initial restore, same pattern as tabs).
+  // Window topology is persisted as one validated record. The legacy split keys are only
+  // read during migration, which removes the crash window where tabs and groups could tear.
+  useEffect(() => {
+    if (!tabsRestored) return;
+    (async () => {
+      try {
+        const state = createWindowState(tabs, groups, activeTabId, activeLeafByGroup);
+        if (validateWindowState(state).length > 0) return;
+        const store = await load("settings.json", { defaults: {}, autoSave: true });
+        await store.set("window_state_v1", state);
+      } catch (_) {}
+    })();
+  }, [tabs, groups, activeTabId, activeLeafByGroup, tabsRestored]);
+
   useEffect(() => {
     if (!tabsRestored) return;
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        await store.set("open_groups", groups);
+        await Promise.all([
+          store.set("interaction_settings_v1", interactionSettings),
+          store.set("restore_unpinned_tabs", restoreUnpinnedTabs),
+          store.set("workspaces_v1", workspaces),
+          store.set("launch_recipes_v1", launchRecipes),
+          store.set("agent_notification_preferences_v1", notificationPreferences),
+        ]);
       } catch (_) {}
     })();
-  }, [groups, tabsRestored]);
-  const groupsRef = useRef<Group[]>([]);
-  useEffect(() => { groupsRef.current = groups; }, [groups]);
+  }, [interactionSettings, restoreUnpinnedTabs, workspaces, launchRecipes, notificationPreferences, tabsRestored]);
   // Which leaf inside an active group currently has focus (receives input).
-  const [activeLeafByGroup, setActiveLeafByGroup] = useState<Record<string, string>>({});
   // Live drag state: which tab is being dragged, which leaf it's hovering over, which edge zone.
   const [dragOver, setDragOver] = useState<{ tabId: string; targetTabId: string | null; zone: DropZone | null } | null>(null);
   // Pointer position for rendering the floating drag ghost.
   const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
   const workAreaRef = useRef<HTMLDivElement>(null);
-  const groupCounterRef = useRef(1);
 
   // Stable DOM host per terminal tab — owned imperatively so React's reconciliation never
   // destroys them. Each host receives a portal-rendered <TerminalTab/> and is physically
@@ -879,21 +1253,18 @@ export default function App() {
   // hook in TabBar uses this as its `items` and would otherwise thrash its effect on every render.
   type Entry = { kind: "tab"; id: string; tab: Tab } | { kind: "group"; id: string; group: Group };
   const entries: Entry[] = useMemo(() => {
-    const seen = new Set<string>();
-    const out: Entry[] = [];
-    for (const t of tabs) {
-      if (t.groupId) {
-        if (seen.has(t.groupId)) continue;
-        const g = groups.find(gr => gr.id === t.groupId);
-        if (!g) continue; // orphaned groupId — defensive skip
-        seen.add(t.groupId);
-        out.push({ kind: "group", id: g.id, group: g });
-      } else {
-        out.push({ kind: "tab", id: t.id, tab: t });
+    const state = createWindowState(tabs, groups, activeTabId, activeLeafByGroup);
+    const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
+    const groupsById = new Map(groups.map(group => [group.id, group]));
+    return state.entryOrder.flatMap((entry): Entry[] => {
+      if (entry.kind === "tab") {
+        const tab = tabsById.get(entry.id);
+        return tab ? [{ kind: "tab", id: tab.id, tab }] : [];
       }
-    }
-    return out;
-  }, [tabs, groups]);
+      const group = groupsById.get(entry.id);
+      return group ? [{ kind: "group", id: group.id, group }] : [];
+    });
+  }, [tabs, groups, activeTabId, activeLeafByGroup]);
 
   // Dissolve a group when it has 0 or 1 leaves left; 1-leaf groups are pointless.
   useEffect(() => {
@@ -936,8 +1307,8 @@ export default function App() {
       if (!group) return;
       if (countLeaves(group.layout) >= MAX_GROUP_LEAVES) return;
       const newLayout = insertLeaf(group.layout, targetTabId, draggedTabId, zone);
-      setGroups(prev => prev.map(g => g.id === group.id ? { ...g, layout: newLayout } : g));
-      setTabs(prev => prev.map(t => t.id === draggedTabId ? { ...t, groupId: group.id } : t));
+      setGroups(prev => prev.map(g => g.id === group.id ? { ...g, layout: newLayout, pinned: g.pinned || dragged.pinned || undefined } : g));
+      setTabs(prev => prev.map(t => t.id === draggedTabId ? { ...t, groupId: group.id, pinned: undefined } : t));
       setActiveTabId(group.id);
       setActiveLeafByGroup(prev => ({ ...prev, [group.id]: draggedTabId }));
     } else {
@@ -951,8 +1322,8 @@ export default function App() {
         ? [draggedLeaf, targetLeaf]
         : [targetLeaf, draggedLeaf];
       const layout: LayoutNode = { kind: "split", direction, children, ratio: 0.5 };
-      setGroups(prev => [...prev, { id, name, layout }]);
-      setTabs(prev => prev.map(t => (t.id === draggedTabId || t.id === targetTabId) ? { ...t, groupId: id } : t));
+      setGroups(prev => [...prev, { id, name, layout, pinned: dragged.pinned || target.pinned || undefined }]);
+      setTabs(prev => prev.map(t => (t.id === draggedTabId || t.id === targetTabId) ? { ...t, groupId: id, pinned: undefined } : t));
       setActiveTabId(id);
       setActiveLeafByGroup(prev => ({ ...prev, [id]: draggedTabId }));
     }
@@ -961,28 +1332,20 @@ export default function App() {
   // Close a pane in a group — removes the underlying tab entirely (matches the
   // expectation that × closes that terminal, not just ejects it).
   const closePaneInGroup = useCallback((tabId: string) => {
-    const tab = tabsRef.current.find(t => t.id === tabId);
-    if (!tab?.groupId) return;
-    const group = groupsRef.current.find(g => g.id === tab.groupId);
-    if (!group) return;
-    const nextLayout = removeLeaf(group.layout, tabId);
-    if (nextLayout) {
-      setGroups(prev => prev.map(g => g.id === group.id ? { ...g, layout: nextLayout } : g));
-      // If the closed pane was the focused leaf, advance focus to another surviving leaf.
-      setActiveLeafByGroup(prev => {
-        if (prev[group.id] !== tabId) return prev;
-        const survivors = collectLeafIds(nextLayout).filter(id => id !== tabId);
-        const next = { ...prev };
-        if (survivors.length) next[group.id] = survivors[0];
-        else delete next[group.id];
-        return next;
-      });
-    } else {
-      setGroups(prev => prev.filter(g => g.id !== group.id));
-      setActiveLeafByGroup(prev => { const n = { ...prev }; delete n[group.id]; return n; });
+    const current = createWindowState(
+      tabsRef.current,
+      groupsRef.current,
+      activeTabIdRef.current,
+      activeLeafByGroupRef.current,
+    );
+    const result = closeWindowPane(current, closedHistoryRef.current, tabId);
+    if (!result.ok) {
+      setAppNotice(result.message);
+      return;
     }
-    setTabs(prev => prev.filter(t => t.id !== tabId));
-  }, []);
+    setClosedHistory(result.history);
+    applyWindowState(result.state);
+  }, [applyWindowState]);
 
   // Adjust a split's ratio at the given path in the active group's layout tree.
   const updateGroupRatio = useCallback((groupId: string, path: number[], ratio: number) => {
@@ -1090,13 +1453,181 @@ export default function App() {
   // Current project context: active terminal's project, or selected project on the project view.
   // Null on home (no context → hide + and dropdown).
   const contextProject: ProjectInfo | null = (() => {
-    if (activeTabProjectPath) {
+    if (activeTab) {
+      if (!activeTabProjectPath) return null;
+      const fallbackName = activeTab.projectName
+        || activeTabProjectPath.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
+        || activeTabProjectPath;
       return allProjects.find(p => p.path.toLowerCase() === activeTabProjectPath.toLowerCase())
-        || (activeTab?.projectName ? { name: activeTab.projectName, path: activeTabProjectPath, encoded_name: "", session_count: 0, last_active: "" } : null);
+        || { name: fallbackName, path: activeTabProjectPath, encoded_name: "", session_count: 0, last_active: "" };
     }
-    if (selectedProject) return selectedProject;
+    if (showHome && selectedProject) return selectedProject;
     return null;
   })();
+
+  const launchAvailability = useMemo(() => ({
+    installedAgents: new Set(AGENT_IDS.filter(agent => installedAgents[agent])),
+    availableShellIds: new Set(getAvailableShells().map(shell => shell.id)),
+  }), [installedAgents]);
+
+  const validateWorkspaceDependencies = useCallback(async (workspace: WorkspaceV1): Promise<WorkspaceDependencyProbe> => {
+    const paths = workspaceDirectories(workspace);
+    const shellIds = workspaceShellIds(workspace, defaultShell);
+    const launches = workspaceCommandPreflights(workspace);
+    const [missingDirectories, missingShells] = await Promise.all([
+      paths.length === 0 ? Promise.resolve([]) : invoke<string[]>("validate_directories", { paths }),
+      shellIds.length === 0 ? Promise.resolve([]) : invoke<string[]>("validate_shell_presets", { shellIds }),
+      launches.length === 0 ? Promise.resolve() : invoke<void>("validate_command_launches", { launches }),
+    ]);
+    return { missingDirectories, missingShells };
+  }, [defaultShell]);
+
+  const handleCaptureWorkspace = useCallback((name: string): string | null => {
+    if (!name.trim()) return "A workspace name is required.";
+    const result = captureWorkspace(createWindowState(
+      tabsRef.current,
+      groupsRef.current,
+      activeTabIdRef.current,
+      activeLeafByGroupRef.current,
+    ), { id: crypto.randomUUID(), name: name.trim() });
+    if (!result.ok) return describePlanIssues(result.issues);
+    setWorkspaces(previous => [...previous, result.value]);
+    return null;
+  }, []);
+
+  const handleSaveWorkspace = useCallback((workspace: WorkspaceV1): string | null => {
+    const decoded = decodeWorkspace(workspace);
+    if (!decoded.ok) return describePlanIssues(decoded.issues);
+    setWorkspaces(previous => {
+      const index = previous.findIndex(candidate => candidate.id === decoded.value.id);
+      if (index < 0) return [...previous, decoded.value];
+      const next = [...previous];
+      next[index] = decoded.value;
+      return next;
+    });
+    return null;
+  }, []);
+
+  const handleDeleteWorkspace = useCallback((id: string) => {
+    setWorkspaces(previous => previous.filter(workspace => workspace.id !== id));
+  }, []);
+
+  const handleOpenWorkspace = useCallback(async (id: string, mode: "merge" | "replace") => {
+    const workspace = workspaces.find(candidate => candidate.id === id);
+    if (!workspace) {
+      setAppNotice("That workspace no longer exists.");
+      return;
+    }
+    const operation = ++planOperationRef.current;
+    let current: ReturnType<typeof createWindowState> | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const candidate = createWindowState(tabsRef.current, groupsRef.current, activeTabIdRef.current, activeLeafByGroupRef.current);
+      const issues = preflightWorkspace(workspace, candidate, mode, launchAvailability);
+      if (issues.length > 0) {
+        setAppNotice(describePlanIssues(issues));
+        return;
+      }
+      const effective = effectiveWorkspaceForPreflight(workspace, candidate, mode).workspace;
+      let missing: WorkspaceDependencyProbe;
+      try {
+        missing = await validateWorkspaceDependencies(effective);
+      } catch (error) {
+        if (operation === planOperationRef.current) setAppNotice(`Workspace preflight failed: ${String(error)}`);
+        return;
+      }
+      if (operation !== planOperationRef.current) return;
+
+      const latest = createWindowState(tabsRef.current, groupsRef.current, activeTabIdRef.current, activeLeafByGroupRef.current);
+      const latestIssues = preflightWorkspace(workspace, latest, mode, launchAvailability);
+      if (latestIssues.length > 0) {
+        setAppNotice(describePlanIssues(latestIssues));
+        return;
+      }
+      const latestEffective = effectiveWorkspaceForPreflight(workspace, latest, mode).workspace;
+      if (workspaceDependencySignature(effective, defaultShell) !== workspaceDependencySignature(latestEffective, defaultShell)) {
+        continue;
+      }
+      if (missing.missingDirectories.length > 0) {
+        setAppNotice(`Workspace not opened. Missing director${missing.missingDirectories.length === 1 ? "y" : "ies"}: ${missing.missingDirectories.join(", ")}`);
+        return;
+      }
+      if (missing.missingShells.length > 0) {
+        setAppNotice(`Workspace not opened. Missing shell presets: ${missing.missingShells.join(", ")}`);
+        return;
+      }
+      current = latest;
+      break;
+    }
+    if (!current) {
+      setAppNotice("Workspace not opened because active sessions kept changing during preflight. Try again.");
+      return;
+    }
+    const result = materializeWorkspace(workspace, current, { mode, availability: launchAvailability });
+    if (!result.ok) {
+      setAppNotice(describePlanIssues(result.issues));
+      return;
+    }
+    applyWindowState(result.value.state);
+    const skipped = result.value.skippedEntries.length;
+    setAppNotice(skipped > 0
+      ? `Workspace opened; skipped ${skipped} duplicate session entr${skipped === 1 ? "y" : "ies"}.`
+      : `Workspace ${mode === "merge" ? "merged" : "replaced"}.`);
+  }, [applyWindowState, defaultShell, launchAvailability, validateWorkspaceDependencies, workspaces]);
+
+  const handleSaveRecipe = useCallback((recipe: LaunchRecipeV1): string | null => {
+    const decoded = decodeLaunchRecipe(recipe);
+    if (!decoded.ok) return describePlanIssues(decoded.issues);
+    setLaunchRecipes(previous => {
+      const index = previous.findIndex(candidate => candidate.id === decoded.value.id);
+      if (index < 0) return [...previous, decoded.value];
+      const next = [...previous];
+      next[index] = decoded.value;
+      return next;
+    });
+    return null;
+  }, []);
+
+  const handleDeleteRecipe = useCallback((id: string) => {
+    setLaunchRecipes(previous => previous.filter(recipe => recipe.id !== id));
+  }, []);
+
+  const handleRunRecipe = useCallback(async (id: string) => {
+    const recipe = launchRecipes.find(candidate => candidate.id === id);
+    if (!recipe) {
+      setAppNotice("That launch recipe no longer exists.");
+      return;
+    }
+    const operation = ++planOperationRef.current;
+    const context = { ...launchAvailability, ...(contextProject?.path ? { projectPath: contextProject.path } : {}) };
+    const preflight = preflightLaunchRecipe(recipe, context);
+    if (!preflight.ok) {
+      setAppNotice(describePlanIssues(preflight.issues));
+      return;
+    }
+    try {
+      const missing = await validateWorkspaceDependencies(preflight.value);
+      if (operation !== planOperationRef.current) return;
+      if (missing.missingDirectories.length > 0) {
+        setAppNotice(`Recipe not run. Missing director${missing.missingDirectories.length === 1 ? "y" : "ies"}: ${missing.missingDirectories.join(", ")}`);
+        return;
+      }
+      if (missing.missingShells.length > 0) {
+        setAppNotice(`Recipe not run. Missing shell presets: ${missing.missingShells.join(", ")}`);
+        return;
+      }
+    } catch (error) {
+      if (operation === planOperationRef.current) setAppNotice(`Recipe preflight failed: ${String(error)}`);
+      return;
+    }
+    const current = createWindowState(tabsRef.current, groupsRef.current, activeTabIdRef.current, activeLeafByGroupRef.current);
+    const result = materializeLaunchRecipe(recipe, current, { context });
+    if (!result.ok) {
+      setAppNotice(describePlanIssues(result.issues));
+      return;
+    }
+    applyWindowState(result.value.state);
+    setAppNotice(`Recipe '${recipe.name}' started.`);
+  }, [applyWindowState, contextProject?.path, launchAvailability, launchRecipes, validateWorkspaceDependencies]);
 
   const handleNewChatInActive = useCallback((agent?: AgentId) => {
     if (contextProject) handleNewChat(contextProject, agent);
@@ -1126,6 +1657,25 @@ export default function App() {
     setTabs(prev => prev.map(tab => tab.id === id && tab.customTitle !== name ? { ...tab, customTitle: name } : tab));
   }, []);
 
+  const handleTogglePin = useCallback((id: string) => {
+    const group = groupsRef.current.find(candidate => candidate.id === id);
+    if (group) {
+      setGroups(prev => prev.map(candidate => candidate.id === id ? { ...candidate, pinned: !candidate.pinned } : candidate));
+      return;
+    }
+    setTabs(prev => prev.map(tab => tab.id === id && !tab.groupId ? { ...tab, pinned: !tab.pinned } : tab));
+  }, []);
+
+  const handleSetInteractionSettings = useCallback((candidate: InteractionSettings): string | null => {
+    const next = sanitizeInteractionSettings(candidate);
+    const conflict = findInteractionSettingConflicts(next)[0];
+    if (conflict) {
+      return `This shortcut conflicts with ${conflict.firstId === conflict.secondId ? "another binding" : `${conflict.firstId} / ${conflict.secondId}`}.`;
+    }
+    setInteractionSettings(next);
+    return null;
+  }, []);
+
   return (
     <div className={`app-layout ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       {/* Boot splash — full-window, screen-centered, drawn above everything (incl. the sidebar)
@@ -1136,13 +1686,13 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar tabs={tabs} entries={entries} onRenameTab={handleRenameTab} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar tabs={tabs} entries={entries} onRenameTab={handleRenameTab} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} onTogglePin={handleTogglePin} onReopenClosed={handleReopenClosed} closedCount={closedHistory.length} workspaces={workspaces} launchRecipes={launchRecipes} onSaveWorkspace={() => { setWorkspaceCaptureName(""); setWorkspaceCaptureOpen(true); }} onOpenWorkspace={(id, mode) => { void handleOpenWorkspace(id, mode); }} onRunRecipe={(id) => { void handleRunRecipe(id); }} activities={activities} interactionSettings={interactionSettings} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(p) => setEditingProjectPath(p)} onHoverProject={setHoveredProjectPath} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectPath={activeTabProjectPath} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
+          <SettingsView theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} restoreUnpinnedTabs={restoreUnpinnedTabs} onSetRestoreUnpinnedTabs={setRestoreUnpinnedTabs} notificationPreferences={notificationPreferences} nativeNotificationPermission={nativeNotificationPermission} onSetNotificationPreferences={handleSetNotificationPreferences} onRequestNotificationPermission={handleRequestNotificationPermission} interactionSettings={interactionSettings} onSetInteractionSettings={handleSetInteractionSettings} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} workspaces={workspaces} launchRecipes={launchRecipes} onCaptureWorkspace={handleCaptureWorkspace} onSaveWorkspace={handleSaveWorkspace} onDeleteWorkspace={handleDeleteWorkspace} onOpenWorkspace={handleOpenWorkspace} onSaveRecipe={handleSaveRecipe} onDeleteRecipe={handleDeleteRecipe} onRunRecipe={handleRunRecipe} updateInfo={updateInfo} />
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
@@ -1225,7 +1775,7 @@ export default function App() {
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
           return createPortal(
-            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
+            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} interactionSettings={interactionSettings} onBranchSwitch={handleSwitchTabToBranch} onActivityEvent={handleActivityEvent} onCommandLaunchConfirmed={handleCommandLaunchConfirmed} />,
             host,
             tab.id,
           );
@@ -1233,6 +1783,30 @@ export default function App() {
       </div>
       </div>
       {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await invoke<ProjectInfo[]>("list_claude_projects")); } catch (_) {} }} />}
+      {workspaceCaptureOpen && (
+        <div className="plan-editor-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setWorkspaceCaptureOpen(false); }}>
+          <form className="workspace-name-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-name-title" onSubmit={event => {
+            event.preventDefault();
+            const error = handleCaptureWorkspace(workspaceCaptureName);
+            if (error) {
+              setAppNotice(error);
+              return;
+            }
+            setWorkspaceCaptureOpen(false);
+            setAppNotice(`Workspace '${workspaceCaptureName.trim()}' saved.`);
+          }}>
+            <div className="plan-editor-kicker">Current window snapshot</div>
+            <h2 id="workspace-name-title">Save workspace</h2>
+            <p>Preserves ordered tabs, groups, sessions, custom titles, pins, active panes, and split ratios.</p>
+            <input value={workspaceCaptureName} onChange={event => setWorkspaceCaptureName(event.target.value)} placeholder="Workspace name" autoFocus />
+            <div className="plan-editor-actions">
+              <button type="button" className="btn btn-ghost" onClick={() => setWorkspaceCaptureOpen(false)}>Cancel</button>
+              <button type="submit" className="btn btn-primary" disabled={!workspaceCaptureName.trim()}>Save snapshot</button>
+            </div>
+          </form>
+        </div>
+      )}
+      {appNotice && <div className="app-notice" role="status"><AlertTriangle size={14} /><span>{appNotice}</span><button type="button" onClick={() => setAppNotice(null)} aria-label="Dismiss"><XIcon size={13} /></button></div>}
       {agentPickerProject && <AgentPickerDialog project={agentPickerProject} agents={AGENT_IDS.filter(a => installedAgents[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
       {editingProjectPath && (() => {
         const proj = allProjects.find(p => p.path.toLowerCase() === editingProjectPath.toLowerCase()) || userProjects.find(p => p.path.toLowerCase() === editingProjectPath.toLowerCase());

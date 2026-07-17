@@ -20,7 +20,7 @@ export function AgentPickerDialog({ project, agents, onPick, onClose, onOpenSett
 
   return (
     <div className="picker-overlay">
-      <div className="picker agent-picker" ref={ref}>
+      <div className="picker agent-picker" ref={ref} role="dialog" aria-modal="true" aria-label={`Pick an agent for ${project.name}`}>
         <div className="picker-band"><span className="picker-band-label">New Chat</span></div>
         <div className="picker-head">
           <div className="picker-title">Pick an agent for {project.name}</div>

@@ -86,7 +86,7 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
 
   return (
     <div className="picker-overlay">
-      <div className="picker" ref={ref}>
+      <div className="picker" ref={ref} role="dialog" aria-modal="true" aria-label="Add projects">
         <div className="picker-band">
           <span className="picker-band-label">Add Projects</span>
         </div>

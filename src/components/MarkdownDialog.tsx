@@ -32,7 +32,7 @@ export function MarkdownDialog({ path, title, onClose }: Props) {
   const body = stripFrontmatter(content);
   return (
     <div className="md-overlay" onClick={onClose}>
-      <div className="md-dialog" onClick={e => e.stopPropagation()}>
+      <div className="md-dialog" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={title || path.split(/[\\/]/).pop()}>
         <div className="md-head">
           <span className="md-title">{title || path.split(/[\\/]/).pop()}</span>
           <button className="md-head-btn" onClick={() => invoke("reveal_in_explorer", { path }).catch(() => {})} {...ttProps(tt, "Reveal in Explorer")}><FolderOpen size={13} /></button>

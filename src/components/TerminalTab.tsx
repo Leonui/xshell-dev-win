@@ -7,6 +7,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Copy, ClipboardPaste, TextSelect } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
@@ -16,6 +17,12 @@ import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBr
 import { getShellById } from "../shells";
 import { AGENTS } from "../agents";
 import type { ThemeMode } from "./SettingsView";
+import { shouldRefocusTerminalAfterMouseAction, terminalMouseEventDisposition, type InteractionSettings, type TerminalMouseAction } from "../lib/interactionSettings";
+import { formatKeyChord, matchesKeyChord, shouldIgnoreKeyEvent } from "../lib/keybindings";
+import { computeTerminalFileLinks } from "../lib/terminalFileLinks";
+import type { ActivityEvent } from "../lib/terminalActivity";
+import { formatTerminalSearchResults, planTerminalSearch } from "../lib/terminalSearch";
+import { CommandLaunchConfirmation } from "./CommandLaunchConfirmation";
 
 const DEFAULT_FONT_SIZE = 14;
 const MIN_FONT_SIZE = 8;
@@ -145,7 +152,10 @@ interface TerminalTabProps {
   // always shows the project path even if stats are available — handy for users who don't
   // want the cost figure visible in screen-shares.
   showTerminalHeaderStats: boolean;
+  interactionSettings: InteractionSettings;
   onBranchSwitch: (tabId: string, newSessionId: string, newTitle: string) => void;
+  onActivityEvent: (tabId: string, event: ActivityEvent) => void;
+  onCommandLaunchConfirmed: (tabId: string) => void;
 }
 
 interface TerminalContextMenuState {
@@ -191,10 +201,11 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
 const PANEL_EDGE_RESERVE = 76;
 
-export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
+export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, interactionSettings, onBranchSwitch, onActivityEvent, onCommandLaunchConfirmed }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   // `shellMode: "claude"` is the persisted legacy name for every agent-backed terminal.
   // Agent-specific behavior must use `tab.agent`, not this mode flag.
@@ -202,12 +213,39 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   const isClaudeAgent = isAgentSession && (tab.agent || "claude") === "claude";
   const [_error, setError] = useState<string | null>(null);
   const tabRef = useRef(tab);
+  const interactionSettingsRef = useRef(interactionSettings);
+  const onActivityEventRef = useRef(onActivityEvent);
+  const activityRunRef = useRef({ generation: 0, runId: crypto.randomUUID() });
+  tabRef.current = tab;
+  interactionSettingsRef.current = interactionSettings;
+  onActivityEventRef.current = onActivityEvent;
   // Loading state: true from spawn until the PTY emits its first byte. That window covers
   // Node.js boot + claude TUI first paint — the "blank screen" the user sees before claude
   // is ready. Universal: works for fresh, --resume, and raw shells.
   const [isInitializing, setIsInitializing] = useState(true);
   const sawFirstOutputRef = useRef(false);
   const [terminalContextMenu, setTerminalContextMenu] = useState<TerminalContextMenuState | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false);
+  const [searchRegex, setSearchRegex] = useState(false);
+  const [searchResults, setSearchResults] = useState({ index: -1, count: 0 });
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [fileLinkError, setFileLinkError] = useState<string | null>(null);
+  const [commandAwaitingConfirmation, setCommandAwaitingConfirmation] = useState(
+    tab.requiresLaunchConfirmation === true && tab.launch?.kind === "command",
+  );
+  const pendingCommandStartRef = useRef<(() => void) | null>(null);
+  const backendSpawnedRef = useRef(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const confirmCommandLaunch = useCallback(() => {
+    const start = pendingCommandStartRef.current;
+    pendingCommandStartRef.current = null;
+    setCommandAwaitingConfirmation(false);
+    onCommandLaunchConfirmed(tab.id);
+    start?.();
+  }, [onCommandLaunchConfirmed, tab.id]);
 
   const [showGitPanel, setShowGitPanel] = useState(false);
   // The git and file-explorer panels share one slot on the right — only one is open at a
@@ -300,17 +338,97 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     terminalRef.current?.paste(selection);
   }, [pasteTerminalClipboard]);
 
+  const closeTerminalSearch = useCallback(() => {
+    searchAddonRef.current?.clearDecorations();
+    setSearchOpen(false);
+    setSearchError(null);
+    setSearchResults({ index: -1, count: 0 });
+    requestAnimationFrame(() => terminalRef.current?.focus());
+  }, []);
+
+  const openTerminalSearch = useCallback(() => {
+    setTerminalContextMenu(null);
+    setSearchOpen(true);
+    requestAnimationFrame(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    });
+  }, []);
+
+  const searchOptions = useCallback((incremental = false): ISearchOptions => ({
+    regex: searchRegex,
+    caseSensitive: searchCaseSensitive,
+    incremental,
+    decorations: {
+      matchBackground: "#6b4b32",
+      matchBorder: "#d18a5c",
+      matchOverviewRuler: "#d18a5c",
+      activeMatchBackground: "#c96442",
+      activeMatchBorder: "#fff4e8",
+      activeMatchColorOverviewRuler: "#fff4e8",
+    },
+  }), [searchCaseSensitive, searchRegex]);
+
+  const runTerminalSearch = useCallback((direction: "next" | "previous", incremental = false) => {
+    const addon = searchAddonRef.current;
+    if (!addon) return;
+    const plan = planTerminalSearch({
+      query: searchQuery,
+      regex: searchRegex,
+      caseSensitive: searchCaseSensitive,
+      direction,
+      incremental,
+    });
+    if (plan.kind === "clear") {
+      addon.clearDecorations();
+      setSearchError(null);
+      setSearchResults({ index: -1, count: 0 });
+      return;
+    }
+    if (plan.kind === "invalid") {
+      addon.clearDecorations();
+      setSearchResults({ index: -1, count: 0 });
+      setSearchError(plan.message);
+      return;
+    }
+    setSearchError(null);
+    const options = { ...searchOptions(plan.options.incremental), ...plan.options };
+    if (plan.direction === "previous") addon.findPrevious(plan.query, options);
+    else addon.findNext(plan.query, options);
+  }, [searchCaseSensitive, searchOptions, searchQuery, searchRegex]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    runTerminalSearch("next", true);
+  }, [searchOpen, searchQuery, searchCaseSensitive, searchRegex, runTerminalSearch]);
+
+  const performMouseAction = useCallback((action: TerminalMouseAction, point?: { x: number; y: number }) => {
+    if (action === "selection-or-clipboard-paste") void pasteTerminalSelectionOrClipboard();
+    else if (action === "paste-clipboard") void pasteTerminalClipboard();
+    else if (action === "copy-selection") copyTerminalSelection();
+    else if (action === "context-menu") {
+      const rect = containerRef.current?.getBoundingClientRect();
+      setTerminalContextMenu({
+        x: point?.x ?? rect?.left ?? 4,
+        y: point?.y ?? rect?.top ?? 4,
+        selection: terminalRef.current?.getSelection() ?? "",
+      });
+    }
+  }, [copyTerminalSelection, pasteTerminalClipboard, pasteTerminalSelectionOrClipboard]);
+
   const openTerminalContextMenu = useCallback((ev: React.MouseEvent<HTMLDivElement>) => {
+    const action = interactionSettingsRef.current.rightClick;
+    if (terminalMouseEventDisposition(2, "contextmenu", action) !== "perform") return;
     ev.preventDefault();
     ev.stopPropagation();
     const rect = containerRef.current?.getBoundingClientRect();
     const keyboardTriggered = ev.clientX === 0 && ev.clientY === 0;
-    setTerminalContextMenu({
+    performMouseAction(action, {
       x: keyboardTriggered && rect ? rect.left + Math.min(32, rect.width / 2) : ev.clientX,
       y: keyboardTriggered && rect ? rect.top + Math.min(32, rect.height / 2) : ev.clientY,
-      selection: terminalRef.current?.getSelection() ?? "",
     });
-  }, []);
+    if (shouldRefocusTerminalAfterMouseAction(action)) focusTerminal();
+  }, [focusTerminal, performMouseAction]);
 
   const handleTerminalContextMenuKeyDown = useCallback((ev: React.KeyboardEvent<HTMLDivElement>) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
@@ -401,6 +519,12 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
+    const searchAddon = new SearchAddon({ highlightLimit: 2000 });
+    term.loadAddon(searchAddon);
+    searchAddonRef.current = searchAddon;
+    const searchResultsDisposable = searchAddon.onDidChangeResults(({ resultIndex, resultCount }) => {
+      setSearchResults({ index: resultIndex, count: resultCount });
+    });
     // Route terminal links through the native system-browser command. The addon's default
     // window.open() handler is unreliable inside a Tauri webview; the Rust command also
     // rejects every scheme except http(s).
@@ -408,6 +532,30 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       event.preventDefault();
       void invoke("open_url", { url }).catch(() => {});
     }));
+    const fileLinkDisposable = term.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        if (!interactionSettingsRef.current.fileLinksEnabled) {
+          callback(undefined);
+          return;
+        }
+        const links = computeTerminalFileLinks(bufferLineNumber, term);
+        callback(links.length > 0 ? links.map(link => ({
+          range: link.range,
+          text: link.text,
+          activate(event: MouseEvent) {
+            event.preventDefault();
+            const current = tabRef.current;
+            void invoke("open_file_in_editor", {
+              path: link.path,
+              projectRoot: current.projectPath || null,
+              line: link.line,
+              column: link.column,
+              editor: interactionSettingsRef.current.editorPreset,
+            }).then(() => setFileLinkError(null)).catch(error => setFileLinkError(String(error)));
+          },
+        })) : undefined);
+      },
+    });
 
     // Unicode 11 width tables. xterm defaults to Unicode v6, which gets the cell width of
     // emoji and many wide chars wrong (status-line icons like 📁, box drawing, CJK) — so text
@@ -436,36 +584,42 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       } catch (_) { /* WebGL unavailable — DOM renderer takes over automatically */ }
     }
 
-    // Terminal-native clipboard conventions: Ctrl+Shift+C always copies, Ctrl+C copies only
-    // when text is selected (otherwise it remains SIGINT), and Ctrl+V / Ctrl+Shift+V paste.
-    // Terminal.paste() normalizes line endings and honors bracketed-paste mode for agent TUIs.
+    // Settings are read through a live ref so remapping never recreates xterm or its PTY.
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
-      const key = ev.key.toLowerCase();
-
-      // Shift+Insert is the long-standing terminal paste shortcut.
-      if (ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey && key === "insert") {
+      if (shouldIgnoreKeyEvent(ev)) return true;
+      const settings = interactionSettingsRef.current;
+      if (matchesKeyChord(ev, settings.terminalSearch)) {
+        ev.preventDefault();
+        openTerminalSearch();
+        return false;
+      }
+      if (ev.ctrlKey && (ev.key === "+" || ev.key === "=")) { applyFontSize(fontSizeRef.current + 1); ev.preventDefault(); return false; }
+      if (ev.ctrlKey && (ev.key === "-" || ev.key === "_")) { applyFontSize(fontSizeRef.current - 1); ev.preventDefault(); return false; }
+      if (ev.ctrlKey && ev.key === "0") { applyFontSize(defaultFontSizeRef.current); ev.preventDefault(); return false; }
+      if (settings.terminalPaste.some(chord => matchesKeyChord(ev, chord))) {
         ev.preventDefault();
         void pasteTerminalClipboard();
         return false;
       }
-
-      const primaryModifier = ev.ctrlKey || ev.metaKey;
-      if (!primaryModifier || ev.altKey) return true;
-      if (ev.ctrlKey && (ev.key === "+" || ev.key === "=")) { applyFontSize(fontSizeRef.current + 1); ev.preventDefault(); return false; }
-      if (ev.ctrlKey && (ev.key === "-" || ev.key === "_")) { applyFontSize(fontSizeRef.current - 1); ev.preventDefault(); return false; }
-      if (ev.ctrlKey && ev.key === "0") { applyFontSize(defaultFontSizeRef.current); ev.preventDefault(); return false; }
-      if ((key === "c" && (ev.shiftKey || term.hasSelection())) || (key === "insert" && term.hasSelection())) {
+      if (settings.terminalCopy.some(chord => matchesKeyChord(ev, chord))) {
+        if (!term.hasSelection() && ev.code === "KeyC" && ev.ctrlKey && !ev.shiftKey && !ev.altKey && !ev.metaKey) return true;
         ev.preventDefault();
         copyTerminalSelection();
         return false;
       }
-      if (key === "v") {
+      if (settings.copyCtrlCWhenSelected && term.hasSelection() && ev.code === "KeyC" && ev.ctrlKey && !ev.altKey && !ev.shiftKey && !ev.metaKey) {
         ev.preventDefault();
-        void pasteTerminalClipboard();
+        copyTerminalSelection();
         return false;
       }
       return true;
+    });
+
+    const selectionDisposable = term.onSelectionChange(() => {
+      if (!interactionSettingsRef.current.copyOnSelect) return;
+      const selection = term.getSelection();
+      if (selection) copyTerminalSelection(selection);
     });
 
     // Ctrl+wheel zoom — natural in editors/terminals.
@@ -494,7 +648,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           // One extra rAF lets any pending flex/layout work flush before we measure.
           requestAnimationFrame(() => {
             fitAddon.fit();
-            spawnBackend(term, fitAddon);
+            startBackendOrAwaitConfirmation(term, fitAddon);
           });
         } else if (eagerInit) {
           // Host is hidden (e.g. parked while another tab is active) but the user opted
@@ -503,7 +657,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           // moment the host is reparented into a visible slot, so claude gets the right
           // dimensions on first view. Without this, every restored tab waits to spawn
           // until the user clicks it, which makes the launch experience feel sluggish.
-          requestAnimationFrame(() => spawnBackend(term, fitAddon));
+          requestAnimationFrame(() => startBackendOrAwaitConfirmation(term, fitAddon));
         } else {
           requestAnimationFrame(tick);
         }
@@ -521,8 +675,38 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     });
     intersectionObserver.observe(containerRef.current);
 
+    function startBackendOrAwaitConfirmation(term: Terminal, fitAddon: FitAddon) {
+      if (backendSpawnedRef.current) return;
+      if (tabRef.current.requiresLaunchConfirmation && tabRef.current.launch?.kind === "command") {
+        setIsInitializing(false);
+        setCommandAwaitingConfirmation(true);
+        pendingCommandStartRef.current = () => { void spawnBackend(term, fitAddon); };
+        return;
+      }
+      void spawnBackend(term, fitAddon);
+    }
+
     async function spawnBackend(term: Terminal, _fitAddon: FitAddon) {
+      if (backendSpawnedRef.current) return;
+      backendSpawnedRef.current = true;
       const id = tabRef.current.id;
+      const activityRun = activityRunRef.current;
+      const emitActivity = (
+        kind: ActivityEvent["kind"],
+        seq: number,
+        extra: Record<string, unknown> = {},
+      ) => {
+        onActivityEventRef.current(id, {
+          source: "pty",
+          kind,
+          eventId: `${activityRun.runId}:pty:${kind}:${crypto.randomUUID()}`,
+          generation: activityRun.generation,
+          runId: activityRun.runId,
+          seq,
+          at: Date.now(),
+          ...extra,
+        } as ActivityEvent);
+      };
 
       // Transport: PTY output arrives as RAW BYTES over a Tauri Channel
       // (binary ArrayBuffer, no JSON event + no utf8-lossy round-trip), pre-coalesced on the
@@ -539,7 +723,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       };
 
       const onExit = new Channel<number>();
-      onExit.onmessage = () => {
+      onExit.onmessage = (exitCode) => {
         // Spawn failed before any output (e.g. claude not on PATH) — drop the loader so
         // the error message we're about to write isn't hidden behind it.
         if (!sawFirstOutputRef.current) {
@@ -547,6 +731,8 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           setIsInitializing(false);
         }
         term.write("\r\n\x1b[90m[Session ended]\x1b[0m\r\n");
+        // Exit is terminal for this run, so place it above every hook sequence.
+        emitActivity("process-exited", Number.MAX_SAFE_INTEGER - 1, { exitCode });
       };
 
       const onDataDisposable = term.onData((data) => {
@@ -568,12 +754,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       });
 
       try {
+        emitActivity("spawn-started", 0);
         const shellMode = tabRef.current.shellMode || "claude";
         // Raw shells always use the tab's explicit shellId. Claude sessions fall back to the
         // user's default shell setting, so claude runs under the shell the user picked.
         const effectiveShellId = tabRef.current.shellId || (shellMode === "claude" ? defaultShellId : null);
         const shellCommand = effectiveShellId ? (getShellById(effectiveShellId)?.command || null) : null;
-        await invoke("spawn_terminal", { id, sessionId: tabRef.current.sessionId || null, cwd: tabRef.current.projectPath || ".", cols: term.cols, rows: term.rows, shellMode, shellCommand, shellId: effectiveShellId, agent: tabRef.current.agent || null, fullscreenRendering, forceSyncOutput, onData, onExit });
+        await invoke("spawn_terminal", { id, sessionId: tabRef.current.sessionId || null, cwd: tabRef.current.projectPath || "", cols: term.cols, rows: term.rows, shellMode, shellCommand, shellId: effectiveShellId, agent: tabRef.current.agent || null, launchSpec: tabRef.current.launch || null, fullscreenRendering, forceSyncOutput, activityGeneration: activityRun.generation, activityRunId: activityRun.runId, onData, onExit });
+        emitActivity("spawn-ready", 1);
         // Post-spawn nudge for ink-based TUIs (claude code). Some Ink renderers ignore the
         // very first SIGWINCH if it arrives mid-bootstrap; a delayed re-fit + forced PTY
         // resize ensures the final cols/rows are picked up cleanly even if xterm's own
@@ -584,6 +772,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           invoke("resize_terminal", { id, cols: terminalRef.current.cols, rows: terminalRef.current.rows }).catch(() => {});
         }, 250);
       } catch (err) {
+        emitActivity("spawn-failed", 1);
         setError(String(err));
         // Locally-written errors don't go through the terminal-output event, so the
         // loader wouldn't auto-clear. Dismiss it here so the message is visible.
@@ -611,6 +800,11 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     return () => {
       resizeObserver.disconnect();
       intersectionObserver.disconnect();
+      searchResultsDisposable.dispose();
+      fileLinkDisposable.dispose();
+      selectionDisposable.dispose();
+      pendingCommandStartRef.current = null;
+      searchAddonRef.current = null;
       containerEl?.removeEventListener("wheel", onWheel);
       if ((term as any)._cleanup) (term as any)._cleanup();
       // Dispose the WebGL addon explicitly before the terminal — its docs note that an
@@ -1071,28 +1265,63 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         </div>
       )}
       <div className="terminal-body">
+        <CommandLaunchConfirmation tab={tab} awaiting={commandAwaitingConfirmation} onConfirm={confirmCommandLaunch} />
+        {searchOpen && (
+          <div className="terminal-search-overlay" role="search" aria-label="Search terminal output">
+            <Search size={13} aria-hidden />
+            <input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={event => setSearchQuery(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === "Escape") { event.preventDefault(); closeTerminalSearch(); }
+                else if (event.key === "Enter" || event.key === "F3") {
+                  event.preventDefault();
+                  runTerminalSearch(event.shiftKey ? "previous" : "next");
+                }
+              }}
+              placeholder="Search terminal"
+              aria-invalid={Boolean(searchError)}
+              aria-label="Search text"
+            />
+            <button type="button" className={searchCaseSensitive ? "active" : ""} onMouseDown={event => event.preventDefault()} onClick={() => setSearchCaseSensitive(value => !value)} aria-pressed={searchCaseSensitive} title="Match case">Aa</button>
+            <button type="button" className={searchRegex ? "active" : ""} onMouseDown={event => event.preventDefault()} onClick={() => setSearchRegex(value => !value)} aria-pressed={searchRegex} title="Use regular expression">.*</button>
+            <span className={`terminal-search-results ${searchError ? "error" : ""}`} aria-live="polite">
+              {formatTerminalSearchResults(searchQuery, searchError, searchResults.index, searchResults.count)}
+            </span>
+            <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => runTerminalSearch("previous")} aria-label="Previous result"><ArrowUp size={12} /></button>
+            <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => runTerminalSearch("next")} aria-label="Next result"><ArrowDown size={12} /></button>
+            <button type="button" onMouseDown={event => event.preventDefault()} onClick={closeTerminalSearch} aria-label="Close search"><XIcon size={12} /></button>
+          </div>
+        )}
+        {fileLinkError && (
+          <div className="terminal-link-error" role="alert">
+            <AlertTriangle size={12} /><span>{fileLinkError}</span><button type="button" onClick={() => setFileLinkError(null)} aria-label="Dismiss"><XIcon size={11} /></button>
+          </div>
+        )}
         <div
           className="terminal-container"
           ref={containerRef}
           style={{ background: paletteFor(theme, terminalBgColor).background }}
           onContextMenu={openTerminalContextMenu}
           onMouseDownCapture={(e) => {
-            // Stop right-button mouse reporting before xterm forwards it to an agent TUI;
-            // the subsequent contextmenu event opens xshell's clipboard menu instead.
-            if (e.button === 2) { e.preventDefault(); e.stopPropagation(); }
-            // With a selection, middle-click first copies and then pastes that exact text.
-            // Otherwise it pastes the existing clipboard. Capture prevents a mouse-aware agent
-            // TUI from receiving the same button press.
-            if (e.button === 1) {
-              e.preventDefault();
-              e.stopPropagation();
-              void pasteTerminalSelectionOrClipboard();
-              focusTerminal();
+            const action = e.button === 1
+              ? interactionSettingsRef.current.middleClick
+              : e.button === 2
+                ? interactionSettingsRef.current.rightClick
+                : "none";
+            const disposition = terminalMouseEventDisposition(e.button, "mousedown", action);
+            if (disposition === "pass") return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (disposition === "perform") {
+              performMouseAction(action, { x: e.clientX, y: e.clientY });
+              if (shouldRefocusTerminalAfterMouseAction(action)) focusTerminal();
             }
           }}
           onAuxClick={(e) => {
-            // Suppress browser autoscroll/new-tab behavior after the handled middle press.
-            if (e.button === 1) { e.preventDefault(); e.stopPropagation(); }
+            const action = e.button === 1 ? interactionSettingsRef.current.middleClick : "none";
+            if (terminalMouseEventDisposition(e.button, "auxclick", action) !== "pass") { e.preventDefault(); e.stopPropagation(); }
           }}
           onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_PATH_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
           onDrop={(e) => {
@@ -1246,7 +1475,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
                 focusTerminal();
               }}
             >
-              <Copy size={13} /><span>Copy</span><span className="terminal-ctx-shortcut">Ctrl+Shift+C</span>
+              <Copy size={13} /><span>Copy</span><span className="terminal-ctx-shortcut">{formatKeyChord(interactionSettings.terminalCopy[0], /Mac|iPhone|iPad/.test(navigator.userAgent) ? "macos" : "windows")}</span>
             </button>
             <button
               type="button"
@@ -1259,7 +1488,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
                 focusTerminal();
               }}
             >
-              <ClipboardPaste size={13} /><span>Paste</span><span className="terminal-ctx-shortcut">Ctrl+V</span>
+              <ClipboardPaste size={13} /><span>Paste</span><span className="terminal-ctx-shortcut">{formatKeyChord(interactionSettings.terminalPaste[0], /Mac|iPhone|iPad/.test(navigator.userAgent) ? "macos" : "windows")}</span>
             </button>
             <div className="terminal-ctx-separator" />
             <button

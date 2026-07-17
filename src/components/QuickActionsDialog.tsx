@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Search, Terminal as TerminalIcon, Settings, X, PanelLeft, ChevronRight, ChevronLeft, Bot } from "lucide-react";
+import { Search, Terminal as TerminalIcon, Settings, X, PanelLeft, ChevronRight, ChevronLeft, Bot, RotateCcw, Save, Layers3, Play } from "lucide-react";
 import { useProjectImage } from "../hooks/useProjectImage";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AgentIcon, type AgentId } from "../agents";
 import { getAvailableShells } from "../shells";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, Tab } from "../types";
+import type { LaunchRecipeV1, WorkspaceV1 } from "../lib/launchPlans";
 
 // Local icon adapter: lets us slot the xshell logo into the same `icon` prop slot as the
 // lucide icons used by other action rows. Matches the sidebar's home-button branding.
@@ -25,9 +26,16 @@ interface QuickActionsDialogProps {
   linkedProjectPath: string | null;
   selectedProjectPath: string | null;
   hasActiveTab: boolean;
+  closedCount: number;
+  workspaces: WorkspaceV1[];
+  launchRecipes: LaunchRecipeV1[];
   installedAgents: Record<AgentId, boolean>;
   onSelectTab: (id: string) => void;
   onCloseTab: (id: string) => void;
+  onReopenClosed: () => void;
+  onSaveWorkspace: () => void;
+  onOpenWorkspace: (id: string, mode: "merge" | "replace") => void;
+  onRunRecipe: (id: string) => void;
   onNewChat: (project: ProjectInfo) => void;
   onNewShell: (project: ProjectInfo | null, shellId: string, shellName: string) => void;
   onGoHome: () => void;
@@ -40,7 +48,7 @@ interface QuickActionsDialogProps {
 // "new-chat-project" and "new-shell" are drill-down views; ← (or Backspace on empty
 // query) pops them back to "actions". The shell drill-down opens in the current
 // context project (the active tab's project, or ~ if there isn't one).
-type View = "tabs" | "actions" | "new-chat-project" | "new-shell";
+type View = "tabs" | "actions" | "new-chat-project" | "new-shell" | "open-workspace" | "run-recipe";
 
 function getInitials(name: string): string {
   const parts = name.replace(/[^a-zA-Z0-9\s\-_.]/g, "").split(/[\s\-_.]+/).filter(Boolean);
@@ -54,7 +62,7 @@ function ProjectMiniIcon({ iconValue, color, name }: { iconValue?: string; color
   return <div className="ts-project-icon" style={{ background: color || undefined }}>{iconValue || getInitials(name || "?")}</div>;
 }
 
-export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProjects, contextProject, hoveredProjectPath, linkedProjectPath, selectedProjectPath, hasActiveTab, installedAgents, onSelectTab, onCloseTab, onNewChat, onNewShell, onGoHome, onOpenSettings, onToggleSidebar, onClose }: QuickActionsDialogProps) {
+export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProjects, contextProject, hoveredProjectPath, linkedProjectPath, selectedProjectPath, hasActiveTab, closedCount, workspaces, launchRecipes, installedAgents, onSelectTab, onCloseTab, onReopenClosed, onSaveWorkspace, onOpenWorkspace, onRunRecipe, onNewChat, onNewShell, onGoHome, onOpenSettings, onToggleSidebar, onClose }: QuickActionsDialogProps) {
   const ref = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -118,13 +126,17 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
   const actions: Action[] = useMemo(() => [
     { id: "new-chat", label: "New chat in...", icon: NewChatIcon, hint: "pick a project", drill: "new-chat-project" },
     { id: "new-shell", label: "New shell in...", icon: TerminalIcon, hint: `pick a shell · opens in ${contextLabel}`, drill: "new-shell" },
+    { id: "save-workspace", label: "Save workspace", icon: Save, hint: "snapshot this window", run: onSaveWorkspace, disabled: tabs.length === 0 },
+    { id: "open-workspace", label: "Open workspace", icon: Layers3, hint: workspaces.length > 0 ? `${workspaces.length} saved` : "no saved workspaces", drill: "open-workspace", disabled: workspaces.length === 0 },
+    { id: "run-recipe", label: "Run recipe", icon: Play, hint: launchRecipes.length > 0 ? `${launchRecipes.length} available` : "no launch recipes", drill: "run-recipe", disabled: launchRecipes.length === 0 },
+    { id: "reopen-closed", label: "Reopen closed", icon: RotateCcw, hint: closedCount > 0 ? `${closedCount} item${closedCount === 1 ? "" : "s"} available` : "nothing closed this session", run: onReopenClosed, disabled: closedCount === 0 },
     { id: "close-tab", label: "Close active tab", icon: X, run: () => { if (hasActiveTab) onCloseTab(activeTabId); }, disabled: !hasActiveTab },
     { id: "go-home", label: "Go home", icon: XShellHomeIcon, run: onGoHome },
     { id: "toggle-sidebar", label: "Toggle sidebar", icon: PanelLeft, run: onToggleSidebar },
     { id: "open-settings", label: "Open settings", icon: Settings, run: onOpenSettings },
   // newChatAgent dep: NewChatIcon is recreated per render but only its agent matters —
   // re-memo when the detection probe changes which agents are installed.
-  ], [hasActiveTab, activeTabId, contextLabel, newChatAgent, onCloseTab, onGoHome, onToggleSidebar, onOpenSettings]);
+  ], [hasActiveTab, activeTabId, closedCount, contextLabel, launchRecipes.length, newChatAgent, onCloseTab, onReopenClosed, onSaveWorkspace, onGoHome, onToggleSidebar, onOpenSettings, tabs.length, workspaces.length]);
 
   // Available shells for the drill-down view.
   const shells = useMemo(() => getAvailableShells(), []);
@@ -152,12 +164,26 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
     });
   }, [pinnedProjects, query, projectIcons]);
 
+  const filteredWorkspaces = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return workspaces;
+    return workspaces.filter(workspace => workspace.name.toLowerCase().includes(q));
+  }, [query, workspaces]);
+
+  const filteredRecipes = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return launchRecipes;
+    return launchRecipes.filter(recipe => `${recipe.name} ${recipe.description || ""} ${recipe.projectPath || ""}`.toLowerCase().includes(q));
+  }, [launchRecipes, query]);
+
   // Currently visible list — drives keyboard navigation and how many rows the dialog shows.
   const listLength =
     view === "tabs" ? filteredTabs.length :
     view === "actions" ? filteredActions.length :
     view === "new-chat-project" ? filteredProjects.length :
-    filteredShells.length;
+    view === "new-shell" ? filteredShells.length :
+    view === "open-workspace" ? filteredWorkspaces.length :
+    filteredRecipes.length;
 
   // Reset highlight + clear query when view changes; reset highlight as result set shrinks.
   useEffect(() => { setHighlightIdx(0); setQuery(""); }, [view]);
@@ -182,10 +208,10 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
       }
       if (e.key === "ArrowLeft") {
         if (view === "actions") { e.preventDefault(); setView("tabs"); }
-        else if (view === "new-chat-project" || view === "new-shell") { e.preventDefault(); setView("actions"); }
+        else if (view !== "tabs") { e.preventDefault(); setView("actions"); }
         return;
       }
-      if (e.key === "Backspace" && query === "" && (view === "new-chat-project" || view === "new-shell")) { e.preventDefault(); setView("actions"); return; }
+      if (e.key === "Backspace" && query === "" && view !== "tabs" && view !== "actions") { e.preventDefault(); setView("actions"); return; }
       if (e.key === "Enter") {
         e.preventDefault();
         if (view === "tabs") {
@@ -199,20 +225,26 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
         } else if (view === "new-chat-project") {
           const pick = filteredProjects[highlightIdx];
           if (pick) { onNewChat(pick); onClose(); }
-        } else {
+        } else if (view === "new-shell") {
           const pick = filteredShells[highlightIdx];
           if (pick) { onNewShell(contextProject, pick.id, pick.name); onClose(); }
+        } else if (view === "open-workspace") {
+          const pick = filteredWorkspaces[highlightIdx];
+          if (pick) { onOpenWorkspace(pick.id, e.shiftKey ? "replace" : "merge"); onClose(); }
+        } else {
+          const pick = filteredRecipes[highlightIdx];
+          if (pick) { onRunRecipe(pick.id); onClose(); }
         }
       }
     };
     document.addEventListener("pointerdown", handlePointer, true);
     document.addEventListener("keydown", handleKey);
     return () => { document.removeEventListener("pointerdown", handlePointer, true); document.removeEventListener("keydown", handleKey); };
-  }, [onClose, listLength, view, query, filteredTabs, filteredActions, filteredProjects, filteredShells, highlightIdx, onSelectTab, onNewChat, onNewShell, contextProject]);
+  }, [onClose, listLength, view, query, filteredTabs, filteredActions, filteredProjects, filteredShells, filteredWorkspaces, filteredRecipes, highlightIdx, onSelectTab, onNewChat, onNewShell, onOpenWorkspace, onRunRecipe, contextProject]);
 
   useEffect(() => {
     const el = listRef.current?.querySelector(`[data-ts-idx="${highlightIdx}"]`) as HTMLElement | null;
-    el?.scrollIntoView({ block: "nearest" });
+    el?.scrollIntoView?.({ block: "nearest" });
   }, [highlightIdx]);
 
   const highlightPath = (hoveredProjectPath || linkedProjectPath || selectedProjectPath || "").toLowerCase();
@@ -222,18 +254,20 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
     view === "tabs" ? "Search active tabs..." :
     view === "actions" ? "Search actions..." :
     view === "new-chat-project" ? "Pick a project..." :
-    "Pick a shell...";
+    view === "new-shell" ? "Pick a shell..." :
+    view === "open-workspace" ? "Open a workspace..." :
+    "Run a recipe...";
 
   // Section divider between claude tabs and raw shells in the Tabs view.
   const firstRawIdx = view === "tabs" ? filteredTabs.findIndex(t => t.shellMode === "raw") : -1;
 
   return (
     <div className="ts-overlay">
-      <div className="ts-dialog" ref={ref}>
+      <div className="ts-dialog" ref={ref} role="dialog" aria-modal="true" aria-label="Quick Actions">
         {/* Segmented pill row — the user's mental model is a pair of tabs that ←/→ swap between. */}
         <div className="ts-views">
           <button className={`ts-view-pill ${view === "tabs" ? "active" : ""}`} onClick={() => setView("tabs")}>Tabs <span className="ts-view-count">{tabs.length}</span></button>
-          <button className={`ts-view-pill ${view === "actions" || view === "new-chat-project" ? "active" : ""}`} onClick={() => setView("actions")}>Actions</button>
+          <button className={`ts-view-pill ${view !== "tabs" ? "active" : ""}`} onClick={() => setView("actions")}>Actions</button>
           <div className="ts-views-spacer" />
           <span className="ts-arrow-hint"><ChevronLeft size={10} /><ChevronRight size={10} /></span>
         </div>
@@ -241,7 +275,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
         <div className="ts-search-row">
           <Search size={14} className="ts-search-icon" />
           <input ref={inputRef} className="ts-search-input" placeholder={placeholder} value={query} onChange={(e) => setQuery(e.target.value)} />
-          {(view === "new-chat-project" || view === "new-shell") && (
+          {(view !== "tabs" && view !== "actions") && (
             <span className="ts-breadcrumb">
               <ChevronLeft size={10} /> back: ←
             </span>
@@ -363,6 +397,56 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
                   <div className="ts-row-sub">opens in {contextLabel}</div>
                 </div>
                 <TerminalIcon size={11} className="ts-row-tag-icon" />
+              </div>
+            );
+          })}
+
+          {/* ── Saved workspace picker ───────────────────────── */}
+          {view === "open-workspace" && filteredWorkspaces.length === 0 && (
+            <div className="ts-empty">No workspaces match your search</div>
+          )}
+          {view === "open-workspace" && filteredWorkspaces.map((workspace, i) => {
+            const isHighlighted = i === highlightIdx;
+            const terminalCount = workspace.entries.reduce((total, entry) => total + (entry.kind === "tab" ? 1 : entry.tabs.length), 0);
+            return (
+              <div
+                key={workspace.id}
+                data-ts-idx={i}
+                className={`ts-row ${isHighlighted ? "highlighted" : ""}`}
+                onMouseEnter={() => handleHover(i)}
+                onClick={() => { onOpenWorkspace(workspace.id, "merge"); onClose(); }}
+              >
+                <div className="ts-action-icon"><Layers3 size={14} /></div>
+                <div className="ts-row-text">
+                  <div className="ts-row-title">{workspace.name}</div>
+                  <div className="ts-row-sub">{workspace.entries.length} entries / {terminalCount} terminals / Enter merges, Shift+Enter replaces</div>
+                </div>
+                <button type="button" className="ts-row-secondary" onClick={event => { event.stopPropagation(); onOpenWorkspace(workspace.id, "replace"); onClose(); }}>Replace</button>
+              </div>
+            );
+          })}
+
+          {/* ── Launch recipe picker ─────────────────────────── */}
+          {view === "run-recipe" && filteredRecipes.length === 0 && (
+            <div className="ts-empty">No recipes match your search</div>
+          )}
+          {view === "run-recipe" && filteredRecipes.map((recipe, i) => {
+            const isHighlighted = i === highlightIdx;
+            const stepCount = recipe.entries.reduce((total, entry) => total + (entry.kind === "tab" ? 1 : entry.tabs.length), 0);
+            return (
+              <div
+                key={recipe.id}
+                data-ts-idx={i}
+                className={`ts-row ${isHighlighted ? "highlighted" : ""}`}
+                onMouseEnter={() => handleHover(i)}
+                onClick={() => { onRunRecipe(recipe.id); onClose(); }}
+              >
+                <div className="ts-action-icon"><Play size={14} /></div>
+                <div className="ts-row-text">
+                  <div className="ts-row-title">{recipe.name}</div>
+                  <div className="ts-row-sub">{recipe.description || `${stepCount} preflighted step${stepCount === 1 ? "" : "s"}`}</div>
+                </div>
+                <Play size={11} className="ts-row-tag-icon" />
               </div>
             );
           })}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot } from "lucide-react";
+import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Keyboard, Bell, PlugZap, Layers3 } from "lucide-react";
+import { sendNotification } from "@tauri-apps/plugin-notification";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -10,6 +11,20 @@ import { DARK_TERM_BG, LIGHT_TERM_BG } from "./TerminalTab";
 import type { UpdateInfo, ReleaseEntry } from "../hooks/useUpdateCheck";
 import { useInstaller } from "../hooks/useInstaller";
 import { renderMarkdown } from "../markdown";
+import {
+  cloneInteractionSettings,
+  getDefaultInteractionSettings,
+  type InteractionSettings,
+} from "../lib/interactionSettings";
+import {
+  DIGIT_KEY_TEMPLATE,
+  formatKeyChord,
+  sanitizeKeyChord,
+  type KeyChord,
+} from "../lib/keybindings";
+import type { AgentNotificationPreferences } from "../lib/terminalActivity";
+import type { LaunchRecipeV1, WorkspaceV1 } from "../lib/launchPlans";
+import { WorkspaceRecipeSettings } from "./WorkspaceRecipeSettings";
 
 export type ThemeMode = "dark" | "light";
 
@@ -58,15 +73,34 @@ interface SettingsViewProps {
   onSetShowTerminalHeaderStats: (enabled: boolean) => void;
   showProjectStatsChart: boolean;
   onSetShowProjectStatsChart: (enabled: boolean) => void;
+  interactionSettings: InteractionSettings;
+  onSetInteractionSettings: (settings: InteractionSettings) => string | null;
+  restoreUnpinnedTabs: boolean;
+  onSetRestoreUnpinnedTabs: (enabled: boolean) => void;
+  notificationPreferences: AgentNotificationPreferences;
+  nativeNotificationPermission: boolean;
+  onSetNotificationPreferences: (preferences: AgentNotificationPreferences) => void;
+  onRequestNotificationPermission: () => Promise<boolean>;
+  workspaces: WorkspaceV1[];
+  launchRecipes: LaunchRecipeV1[];
+  onCaptureWorkspace: (name: string) => string | null;
+  onSaveWorkspace: (workspace: WorkspaceV1) => string | null;
+  onDeleteWorkspace: (id: string) => void;
+  onOpenWorkspace: (id: string, mode: "merge" | "replace") => Promise<void>;
+  onSaveRecipe: (recipe: LaunchRecipeV1) => string | null;
+  onDeleteRecipe: (id: string) => void;
+  onRunRecipe: (id: string) => Promise<void>;
   updateInfo: UpdateInfo;
 }
 
-type Category = "appearance" | "agents" | "terminal" | "behavior" | "about";
+type Category = "appearance" | "agents" | "terminal" | "input" | "workspaces" | "behavior" | "about";
 
 const CATEGORIES: { id: Category; label: string; icon: React.ComponentType<{ size?: number }> }[] = [
   { id: "appearance", label: "Appearance", icon: Paintbrush },
   { id: "agents",     label: "Agents",     icon: Bot },
   { id: "terminal",   label: "Terminal",   icon: TerminalIcon },
+  { id: "input",      label: "Input",      icon: Keyboard },
+  { id: "workspaces", label: "Workspaces", icon: Layers3 },
   { id: "behavior",   label: "Behavior",   icon: SettingsIcon },
   { id: "about",      label: "About",      icon: Info },
 ];
@@ -74,6 +108,19 @@ const CATEGORIES: { id: Category; label: string; icon: React.ComponentType<{ siz
 // Mirror of the Rust AgentBinaryProbe — result of resolving an agent CLI on the user's PATH.
 interface AgentProbe { installed: boolean; path: string | null; version: string | null }
 type AgentProbeState = { loading: boolean; probe: AgentProbe | null };
+
+interface ProviderHookStatus {
+  provider: "claude" | "codex";
+  path: string;
+  installed: boolean;
+  manualTrustRequired: boolean;
+  error: string | null;
+}
+
+interface ActivityHooksProbe {
+  claude: ProviderHookStatus;
+  codex: ProviderHookStatus;
+}
 
 // Identity card at the top of each agent's block on the Agents page: icon + name, the
 // resolved binary path once detected, and a live found / not-found chip. `--version` output
@@ -167,7 +214,66 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+function KeybindingRecorder({ value, digitTemplate, onChange }: { value: KeyChord; digitTemplate?: boolean; onChange: (value: KeyChord) => string | null }) {
+  const [recording, setRecording] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
+
+  useEffect(() => {
+    if (!recording) return;
+    document.documentElement.dataset.keybindingRecording = "true";
+    const record = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.code === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+        setRecording(false);
+        setError(null);
+        return;
+      }
+      if (/^(?:Alt|Control|Meta|Shift)(?:Left|Right)$/.test(event.code)) return;
+      if (event.isComposing || event.keyCode === 229 || event.getModifierState("AltGraph")) return;
+      const code = digitTemplate && /^Digit[1-9]$/.test(event.code) ? DIGIT_KEY_TEMPLATE : event.code;
+      if (digitTemplate && code !== DIGIT_KEY_TEMPLATE) {
+        setError("Press the desired modifier together with a number from 1 to 9.");
+        return;
+      }
+      const parsed = sanitizeKeyChord({
+        code,
+        ctrl: event.ctrlKey,
+        alt: event.altKey,
+        shift: event.shiftKey,
+        meta: event.metaKey,
+      }, { allowDigitTemplate: digitTemplate });
+      if (!parsed) {
+        setError("Bare printable keys and unsupported key combinations cannot be global shortcuts.");
+        return;
+      }
+      const conflict = onChange(parsed);
+      if (conflict) {
+        setError(conflict);
+        return;
+      }
+      setError(null);
+      setRecording(false);
+    };
+    window.addEventListener("keydown", record, true);
+    return () => {
+      window.removeEventListener("keydown", record, true);
+      delete document.documentElement.dataset.keybindingRecording;
+    };
+  }, [recording, digitTemplate, onChange]);
+
+  return (
+    <div className="settings-keybinding-control">
+      <button type="button" className={`settings-keybinding ${recording ? "recording" : ""}`} onClick={() => { setError(null); setRecording(value => !value); }}>
+        {recording ? "Press shortcut..." : formatKeyChord(value, isMac ? "macos" : "windows")}
+      </button>
+      {error && <span className="settings-keybinding-error">{error}</span>}
+    </div>
+  );
+}
+
+export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, interactionSettings, onSetInteractionSettings, restoreUnpinnedTabs, onSetRestoreUnpinnedTabs, notificationPreferences, nativeNotificationPermission, onSetNotificationPreferences, onRequestNotificationPermission, workspaces, launchRecipes, onCaptureWorkspace, onSaveWorkspace, onDeleteWorkspace, onOpenWorkspace, onSaveRecipe, onDeleteRecipe, onRunRecipe, updateInfo }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -181,6 +287,10 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
   // Both agents start collapsed — the header chips already answer the "is it installed?"
   // question on their own; expanding is for digging into an agent's settings.
   const [expandedAgents, setExpandedAgents] = useState<Record<AgentId, boolean>>(() => Object.fromEntries(AGENT_IDS.map(id => [id, false])) as Record<AgentId, boolean>);
+  const [activityHooks, setActivityHooks] = useState<ActivityHooksProbe | null>(null);
+  const [activityHookLoading, setActivityHookLoading] = useState(false);
+  const [activityHookError, setActivityHookError] = useState<string | null>(null);
+  const [notificationError, setNotificationError] = useState<string | null>(null);
   const toggleAgent = (id: AgentId) => setExpandedAgents(prev => ({ ...prev, [id]: !prev[id] }));
   const installer = useInstaller(updateInfo.update);
   const shells = getAvailableShells();
@@ -205,6 +315,55 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
 
   const onAgentsPage = active === "agents";
   useEffect(() => { if (onAgentsPage) probeAgents(); }, [onAgentsPage, probeAgents]);
+
+  const refreshActivityHooks = useCallback(async () => {
+    setActivityHookLoading(true);
+    setActivityHookError(null);
+    try {
+      setActivityHooks(await invoke<ActivityHooksProbe>("probe_activity_hooks"));
+    } catch (error) {
+      setActivityHookError(String(error));
+    } finally {
+      setActivityHookLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (active === "behavior") void refreshActivityHooks();
+  }, [active, refreshActivityHooks]);
+
+  const installActivityHook = useCallback(async (provider: "claude" | "codex") => {
+    setActivityHookLoading(true);
+    setActivityHookError(null);
+    try {
+      await invoke("install_activity_hooks", { provider });
+      setActivityHooks(await invoke<ActivityHooksProbe>("probe_activity_hooks"));
+    } catch (error) {
+      setActivityHookError(String(error));
+    } finally {
+      setActivityHookLoading(false);
+    }
+  }, []);
+
+  const setNotificationEnabled = useCallback(async (enabled: boolean) => {
+    setNotificationError(null);
+    if (!enabled) {
+      onSetNotificationPreferences({ ...notificationPreferences, enabled: false });
+      return;
+    }
+    const granted = nativeNotificationPermission || await onRequestNotificationPermission();
+    if (!granted) {
+      setNotificationError("Windows notification permission was not granted. Tab and taskbar indicators still work.");
+      return;
+    }
+    onSetNotificationPreferences({ ...notificationPreferences, enabled: true });
+  }, [nativeNotificationPermission, notificationPreferences, onRequestNotificationPermission, onSetNotificationPreferences]);
+
+  const updateInteraction = useCallback((mutate: (next: InteractionSettings) => void): string | null => {
+    const next = cloneInteractionSettings(interactionSettings);
+    mutate(next);
+    return onSetInteractionSettings(next);
+  }, [interactionSettings, onSetInteractionSettings]);
 
   return (
     <div className="settings-view fade-in">
@@ -409,6 +568,9 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
               </Section>
 
               <Section title="Startup" description="What happens to your saved tabs when xshell launches.">
+                <SettingRow title="Restore unpinned tabs" description="Restore regular tabs and groups from the previous window. Pinned entries always restore; command tabs still wait for explicit confirmation before running.">
+                  <Toggle checked={restoreUnpinnedTabs} onChange={onSetRestoreUnpinnedTabs} />
+                </SettingRow>
                 <SettingRow title="Pre-initialize tabs on launch" description="Spawn each restored tab's session immediately at app start, instead of deferring until you click into the tab. Agents take a few seconds to boot, so eager init means the session is ready (or close to it) by the time you switch to it. Open a tab whose session is still booting and the starting spinner shows until the first frame renders.">
                   <Toggle checked={eagerInitTabs} onChange={onSetEagerInitTabs} />
                 </SettingRow>
@@ -428,8 +590,135 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
             </>
           )}
 
+          {active === "input" && (
+            <>
+              <Section title="Keyboard shortcuts" description="Bindings use physical key positions and exact modifiers. Click a binding, then press the replacement shortcut; Escape cancels recording.">
+                <SettingRow title="Quick Actions" description="Open the command and tab switcher.">
+                  <KeybindingRecorder value={interactionSettings.quickActions} onChange={value => updateInteraction(next => { next.quickActions = value; })} />
+                </SettingRow>
+                <SettingRow title="Visible tab switching" description="Choose the modifier used with 1 through 9. A group occupies one visible position.">
+                  <KeybindingRecorder digitTemplate value={interactionSettings.quickSwitch} onChange={value => updateInteraction(next => { next.quickSwitch = value; })} />
+                </SettingRow>
+                <SettingRow title="Terminal search" description="Open search inside the focused terminal without sending the keystroke to the PTY.">
+                  <KeybindingRecorder value={interactionSettings.terminalSearch} onChange={value => updateInteraction(next => { next.terminalSearch = value; })} />
+                </SettingRow>
+                <SettingRow title="Reopen closed" description="Restore the most recently closed tab, group, or pane with fresh runtime IDs.">
+                  <KeybindingRecorder value={interactionSettings.reopenClosed} onChange={value => updateInteraction(next => { next.reopenClosed = value; })} />
+                </SettingRow>
+                <SettingRow title="Terminal copy" description="Copy the active terminal selection. Ctrl+C still interrupts when no selection exists.">
+                  <KeybindingRecorder value={interactionSettings.terminalCopy[0]} onChange={value => updateInteraction(next => { next.terminalCopy = [value]; })} />
+                </SettingRow>
+                <SettingRow title="Terminal paste" description="Paste through xterm so bracketed-paste mode and line endings remain correct.">
+                  <KeybindingRecorder value={interactionSettings.terminalPaste[0]} onChange={value => updateInteraction(next => { next.terminalPaste = [value]; })} />
+                </SettingRow>
+                <div className="settings-section-actions">
+                  <button type="button" className="settings-reset-btn" onClick={() => onSetInteractionSettings(getDefaultInteractionSettings())}><RotateCcw size={11} /> Reset input defaults</button>
+                </div>
+              </Section>
+
+              <Section title="Mouse" description="Handled mouse buttons are consumed before mouse-aware terminal applications receive them.">
+                <SettingRow title="Copy on selection" description="Write newly selected terminal text to the system clipboard.">
+                  <Toggle checked={interactionSettings.copyOnSelect} onChange={value => { updateInteraction(next => { next.copyOnSelect = value; }); }} />
+                </SettingRow>
+                <SettingRow title="Ctrl+C copies a selection" description="When enabled, Ctrl+C copies if text is selected and remains SIGINT otherwise.">
+                  <Toggle checked={interactionSettings.copyCtrlCWhenSelected} onChange={value => { updateInteraction(next => { next.copyCtrlCWhenSelected = value; }); }} />
+                </SettingRow>
+                <SettingRow title="Middle click" description="Selection-or-clipboard paste copies and pastes a selection, otherwise pastes the clipboard.">
+                  <select className="settings-select" value={interactionSettings.middleClick} onChange={event => { updateInteraction(next => { next.middleClick = event.target.value as InteractionSettings["middleClick"]; }); }}>
+                    <option value="selection-or-clipboard-paste">Selection or clipboard paste</option>
+                    <option value="paste-clipboard">Paste clipboard</option>
+                    <option value="copy-selection">Copy selection</option>
+                    <option value="context-menu">Context menu</option>
+                    <option value="none">Pass through</option>
+                  </select>
+                </SettingRow>
+                <SettingRow title="Right click" description="Choose xshell's clipboard menu, another clipboard action, or pass the event through.">
+                  <select className="settings-select" value={interactionSettings.rightClick} onChange={event => { updateInteraction(next => { next.rightClick = event.target.value as InteractionSettings["rightClick"]; }); }}>
+                    <option value="context-menu">Context menu</option>
+                    <option value="selection-or-clipboard-paste">Selection or clipboard paste</option>
+                    <option value="paste-clipboard">Paste clipboard</option>
+                    <option value="copy-selection">Copy selection</option>
+                    <option value="none">Pass through</option>
+                  </select>
+                </SettingRow>
+              </Section>
+
+              <Section title="File references" description="Recognize source locations in terminal output and open them with structured native arguments.">
+                <SettingRow title="Clickable file references" description="Recognize Windows, UNC, POSIX, and project-relative paths with line and column locations.">
+                  <Toggle checked={interactionSettings.fileLinksEnabled} onChange={value => { updateInteraction(next => { next.fileLinksEnabled = value; }); }} />
+                </SettingRow>
+                <SettingRow title="Editor" description="Only fixed editor presets are allowed; terminal text is never interpolated into a shell command.">
+                  <select className="settings-select" value={interactionSettings.editorPreset} onChange={event => { updateInteraction(next => { next.editorPreset = event.target.value as InteractionSettings["editorPreset"]; }); }}>
+                    <option value="system">System default</option>
+                    <option value="visual-studio-code">Visual Studio Code</option>
+                    <option value="cursor">Cursor</option>
+                  </select>
+                </SettingRow>
+              </Section>
+            </>
+          )}
+
+          {active === "workspaces" && (
+            <WorkspaceRecipeSettings
+              workspaces={workspaces}
+              recipes={launchRecipes}
+              defaultShell={defaultShell}
+              defaultAgent={defaultAgent === "ask" ? "claude" : defaultAgent}
+              onCaptureWorkspace={onCaptureWorkspace}
+              onSaveWorkspace={onSaveWorkspace}
+              onDeleteWorkspace={onDeleteWorkspace}
+              onOpenWorkspace={onOpenWorkspace}
+              onSaveRecipe={onSaveRecipe}
+              onDeleteRecipe={onDeleteRecipe}
+              onRunRecipe={onRunRecipe}
+            />
+          )}
+
           {active === "behavior" && (
             <>
+              <Section title="Agent activity" description="Opt-in lifecycle hooks provide authoritative running, waiting, permission, and completion states. Terminal silence and output text are never treated as completion evidence.">
+                {(["claude", "codex"] as const).map(provider => {
+                  const status = activityHooks?.[provider];
+                  const label = provider === "claude" ? "Claude Code" : "Codex";
+                  return (
+                    <SettingRow key={provider} title={`${label} lifecycle hook`} description={status?.manualTrustRequired ? `Configured in ${status.path}. In Codex, run /hooks and approve the xshell hook; xshell cannot read Codex's trust decision.` : status?.installed ? `Configured through ${status.path}. New agent terminals inherit the bridge automatically.` : `Merge xshell's lifecycle commands into ${status?.path || `${provider}'s user configuration`} without replacing unrelated hooks.`}>
+                      <button type="button" className={`btn ${status?.installed ? "btn-ghost" : "btn-primary"} settings-action-btn`} disabled={activityHookLoading} onClick={() => void installActivityHook(provider)}>
+                        {activityHookLoading ? <Loader2 size={11} className="settings-spin" /> : status?.installed ? <CheckCircle2 size={11} /> : <PlugZap size={11} />}
+                        {status?.installed ? "Reinstall" : "Connect"}
+                      </button>
+                    </SettingRow>
+                  );
+                })}
+                <div className="settings-section-actions">
+                  <button type="button" className="settings-reset-btn" disabled={activityHookLoading} onClick={() => void refreshActivityHooks()}><RefreshCw size={11} /> Re-check hooks</button>
+                </div>
+                {(activityHookError || activityHooks?.claude.error || activityHooks?.codex.error) && (
+                  <div className="settings-install-error" role="alert"><AlertTriangle size={12} /><span>{activityHookError || activityHooks?.claude.error || activityHooks?.codex.error}</span></div>
+                )}
+              </Section>
+
+              <Section title="Notifications" description="Permission is requested only when you enable native notifications. Activity dots and the Windows taskbar overlay work even when permission is denied.">
+                <SettingRow title="Native agent notifications" description={nativeNotificationPermission ? "Send privacy-safe notifications without prompt text, output, project paths, or tab titles." : "Enabling this explicitly requests Windows notification permission."}>
+                  <Toggle checked={notificationPreferences.enabled} onChange={value => { void setNotificationEnabled(value); }} />
+                </SettingRow>
+                <SettingRow title="Only when the window is unfocused" description="Suppress native toasts while xshell has focus. The exact selected leaf is always considered attended.">
+                  <Toggle checked={notificationPreferences.onlyWhenWindowUnfocused} disabled={!notificationPreferences.enabled} onChange={value => onSetNotificationPreferences({ ...notificationPreferences, onlyWhenWindowUnfocused: value })} />
+                </SettingRow>
+                <SettingRow title="Turn completed" description="Notify after a prompt submitted in this terminal reaches an authoritative provider Stop event.">
+                  <Toggle checked={notificationPreferences.notifyOnTurnComplete} disabled={!notificationPreferences.enabled} onChange={value => onSetNotificationPreferences({ ...notificationPreferences, notifyOnTurnComplete: value })} />
+                </SettingRow>
+                <SettingRow title="Permission or input required" description="Notify when the provider reports a permission request or idle input prompt.">
+                  <Toggle checked={notificationPreferences.notifyOnNeedsInput} disabled={!notificationPreferences.enabled} onChange={value => onSetNotificationPreferences({ ...notificationPreferences, notifyOnNeedsInput: value })} />
+                </SettingRow>
+                <SettingRow title="Agent failures" description="Notify on spawn failures, provider failures, and unexpected agent process exits.">
+                  <Toggle checked={notificationPreferences.notifyOnFailure} disabled={!notificationPreferences.enabled} onChange={value => onSetNotificationPreferences({ ...notificationPreferences, notifyOnFailure: value })} />
+                </SettingRow>
+                <div className="settings-section-actions">
+                  <button type="button" className="settings-reset-btn" disabled={!notificationPreferences.enabled || !nativeNotificationPermission} onClick={() => { setNotificationError(null); try { sendNotification({ title: "xshell", body: "Agent notifications are ready." }); } catch (error) { setNotificationError(String(error)); } }}><Bell size={11} /> Send test notification</button>
+                </div>
+                {notificationError && <div className="settings-install-error" role="alert"><AlertTriangle size={12} /><span>{notificationError}</span></div>}
+              </Section>
+
               <Section title="Window" description="How the xshell window itself behaves.">
                 <SettingRow title="Always on top" description="Keep the xshell window above all other applications, even when they have focus.">
                   <Toggle checked={alwaysOnTop} onChange={onSetAlwaysOnTop} />

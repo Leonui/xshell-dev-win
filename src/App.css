@@ -647,7 +647,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .group-pane-active .terminal-header-label { background: var(--accent-terracotta-dim); border-color: var(--accent-terracotta); }
 .group-pane-active .terminal-header-title { color: var(--accent-coral); }
 
-.terminal-body { flex: 1; display: flex; flex-direction: row; overflow: hidden; min-height: 0; }
+.terminal-body { flex: 1; display: flex; flex-direction: row; overflow: hidden; min-height: 0; position: relative; }
 .terminal-container { flex: 1; padding: 4px; background: var(--bg-surface); overflow: hidden; min-width: 0; position: relative; }
 .terminal-container .xterm { height: 100%; }
 .terminal-container .xterm-viewport { overflow-y: auto !important; }
@@ -1789,6 +1789,143 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 
 .picker-footer { padding: 12px 16px; margin-top: 12px; border-top: 1px dashed var(--border-default); display: flex; align-items: center; gap: 8px; }
 .picker-footer-hint { flex: 1; font-size: 10px; color: var(--text-muted); }
+
+/* ── First-batch interaction surfaces ────────────────────────────── */
+
+.tab-pinned { border-top-color: color-mix(in oklab, var(--accent-terracotta) 55%, transparent); }
+.tab-pin-indicator { flex: 0 0 auto; color: var(--accent-coral); }
+
+.tab-activity { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; min-width: 8px; color: var(--text-muted); }
+.tab-activity-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 2px color-mix(in oklab, currentColor 15%, transparent); }
+.tab-activity-starting { color: #d3a33d; }
+.tab-activity-running { color: #4e9ee8; }
+.tab-activity-waiting { color: var(--accent-coral); }
+.tab-activity-exited { color: var(--error); }
+.tab-activity-unread .tab-activity-dot { animation: activityPulse 1.8s ease-in-out infinite; }
+.tab-activity-count { min-width: 13px; height: 13px; padding: 0 3px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; background: currentColor; color: var(--bg-deep); font-family: var(--font-mono); font-size: 8px; font-weight: 700; }
+@keyframes activityPulse { 0%, 100% { box-shadow: 0 0 0 2px color-mix(in oklab, currentColor 16%, transparent); } 50% { box-shadow: 0 0 0 5px color-mix(in oklab, currentColor 4%, transparent); } }
+
+.tab-entry-menu { position: fixed; z-index: 3100; width: 184px; display: flex; flex-direction: column; gap: 2px; padding: 5px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); box-shadow: 0 16px 40px rgba(0, 0, 0, 0.42); animation: scaleIn 0.1s ease; }
+.tab-entry-menu button { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-secondary); font: inherit; font-size: 11px; text-align: left; cursor: pointer; }
+.tab-entry-menu button:hover { background: var(--bg-hover); color: var(--text-primary); }
+.tab-entry-menu button:disabled { opacity: 0.4; cursor: not-allowed; }
+.tab-entry-menu button:disabled:hover { background: transparent; color: var(--text-secondary); }
+
+.terminal-search-overlay { position: absolute; z-index: 70; top: 8px; right: 10px; display: flex; align-items: center; gap: 4px; min-height: 34px; padding: 4px 5px 4px 9px; border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: color-mix(in oklab, var(--bg-elevated) 96%, transparent); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35); color: var(--text-muted); backdrop-filter: blur(10px); }
+.terminal-search-overlay input { width: min(260px, 34vw); border: 0; border-right: 1px solid var(--border-default); outline: 0; padding: 3px 8px 3px 3px; background: transparent; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; }
+.terminal-search-overlay input::placeholder { color: var(--text-muted); }
+.terminal-search-overlay input[aria-invalid="true"] { color: #e77b77; }
+.terminal-search-overlay button { min-width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-secondary); font-family: var(--font-mono); font-size: 10px; cursor: pointer; }
+.terminal-search-overlay button:hover, .terminal-search-overlay button.active { background: var(--bg-active); color: var(--text-primary); }
+.terminal-search-overlay button.active { box-shadow: inset 0 -1px 0 var(--accent-coral); }
+.terminal-search-results { min-width: 58px; padding: 0 4px; color: var(--text-tertiary); font-family: var(--font-mono); font-size: 9px; text-align: center; }
+.terminal-search-results.error { color: #e77b77; }
+.terminal-link-error { position: absolute; z-index: 69; right: 10px; top: 49px; max-width: min(540px, calc(100% - 20px)); display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid color-mix(in oklab, var(--error) 55%, var(--border-default)); border-radius: var(--radius-sm); background: color-mix(in oklab, var(--bg-elevated) 96%, transparent); color: #e77b77; font-size: 10px; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28); }
+.terminal-link-error span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-link-error button { display: inline-flex; border: 0; padding: 2px; background: transparent; color: inherit; cursor: pointer; }
+
+.settings-keybinding-control { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.settings-keybinding { min-width: 132px; padding: 5px 9px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-deep); color: var(--text-secondary); font-family: var(--font-mono); font-size: 10px; cursor: pointer; transition: border-color 0.12s, color 0.12s, box-shadow 0.12s; }
+.settings-keybinding:hover { border-color: var(--border-strong); color: var(--text-primary); }
+.settings-keybinding.recording { border-color: var(--accent-terracotta); color: var(--accent-coral); box-shadow: 0 0 0 2px var(--accent-terracotta-dim); }
+.settings-keybinding-error { max-width: 250px; color: #e77b77; font-size: 9px; line-height: 1.35; text-align: right; }
+.settings-section-actions { display: flex; justify-content: flex-end; gap: 6px; padding-top: 8px; }
+.settings-reset-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.app-notice { position: fixed; z-index: 4000; right: 18px; bottom: 18px; max-width: min(460px, calc(100vw - 36px)); display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid color-mix(in oklab, var(--accent-terracotta) 50%, var(--border-default)); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-secondary); font-size: 11px; box-shadow: 0 14px 38px rgba(0, 0, 0, 0.38); animation: scaleIn 0.14s ease; }
+.app-notice > svg { flex: 0 0 auto; color: var(--accent-coral); }
+.app-notice span { flex: 1; }
+.app-notice button { display: inline-flex; padding: 3px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); cursor: pointer; }
+.app-notice button:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.terminal-command-confirm { position: absolute; z-index: 60; inset: 0; display: flex; align-items: center; justify-content: center; gap: 14px; padding: 28px; background: color-mix(in oklab, var(--bg-deep) 91%, transparent); backdrop-filter: blur(8px); }
+.terminal-command-confirm-mark { width: 38px; height: 38px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; border: 1px solid color-mix(in oklab, var(--accent-coral) 55%, var(--border-default)); border-radius: 50%; background: var(--accent-terracotta-dim); color: var(--accent-coral); }
+.terminal-command-confirm-copy { max-width: 560px; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.terminal-command-confirm-copy strong { color: var(--text-primary); font-size: 13px; }
+.terminal-command-confirm-copy span { color: var(--text-tertiary); font-size: 11px; line-height: 1.5; }
+.terminal-command-confirm-copy code { max-height: 120px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-secondary); font: 10px/1.5 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.plan-settings { display: flex; flex-direction: column; gap: 18px; padding-bottom: 24px; }
+.plan-library-section { overflow: hidden; border: 1px solid var(--border-default); border-radius: var(--radius-lg); background: linear-gradient(145deg, color-mix(in oklab, var(--bg-elevated) 84%, var(--accent-terracotta-dim)), var(--bg-elevated) 38%); }
+.plan-library-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 16px 18px; border-bottom: 1px solid var(--border-subtle); }
+.plan-library-title { display: flex; align-items: center; gap: 7px; color: var(--text-primary); font-size: 13px; font-weight: 650; }
+.plan-library-title svg { color: var(--accent-coral); }
+.plan-library-head p { max-width: 700px; margin: 5px 0 0; color: var(--text-muted); font-size: 10px; line-height: 1.5; }
+.plan-capture-row { display: flex; gap: 6px; flex: 0 0 auto; }
+.plan-capture-row input, .plan-rename-input, .plan-field input, .workspace-name-dialog input { min-width: 0; padding: 7px 9px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); outline: 0; background: var(--bg-deep); color: var(--text-primary); font: 11px var(--font-sans); }
+.plan-capture-row input:focus, .plan-rename-input:focus, .plan-field input:focus, .workspace-name-dialog input:focus { border-color: var(--focus-ring); box-shadow: 0 0 0 2px color-mix(in oklab, var(--focus-ring) 18%, transparent); }
+.plan-capture-row input { width: 180px; }
+.plan-card-list { display: flex; flex-direction: column; }
+.plan-card { display: flex; align-items: center; gap: 16px; min-height: 66px; padding: 11px 14px 11px 18px; border-bottom: 1px solid var(--border-subtle); }
+.plan-card:last-child { border-bottom: 0; }
+.plan-card:hover { background: color-mix(in oklab, var(--bg-hover) 68%, transparent); }
+.plan-card-main { flex: 1; min-width: 180px; }
+.plan-card-name { color: var(--text-primary); font-size: 11px; font-weight: 600; }
+.plan-card-meta { margin-top: 3px; color: var(--text-muted); font: 9px/1.4 var(--font-mono); overflow-wrap: anywhere; }
+.plan-card-description { margin-top: 4px; color: var(--text-tertiary); font-size: 10px; line-height: 1.35; }
+.plan-rename-input { width: min(340px, 100%); }
+.plan-card-actions { display: flex; align-items: center; justify-content: flex-end; gap: 3px; flex-wrap: wrap; }
+.plan-card-actions button, .plan-template-buttons button, .plan-icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 27px; padding: 4px 7px; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--text-tertiary); font: 9px var(--font-sans); cursor: pointer; }
+.plan-card-actions button:hover, .plan-template-buttons button:hover, .plan-icon-button:hover { border-color: var(--border-default); background: var(--bg-hover); color: var(--text-primary); }
+.plan-card-actions .plan-primary-action { border-color: color-mix(in oklab, var(--accent-terracotta) 45%, var(--border-default)); color: var(--accent-coral); }
+.plan-card-actions .danger:hover { border-color: color-mix(in oklab, var(--error) 50%, var(--border-default)); color: #e77b77; }
+.plan-empty { padding: 22px 18px; color: var(--text-muted); font-size: 10px; text-align: center; }
+.plan-inline-message { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-secondary); font-size: 10px; }
+.plan-inline-message.success { border-color: color-mix(in oklab, var(--success) 45%, var(--border-default)); }
+.plan-inline-message.error { border-color: color-mix(in oklab, var(--error) 55%, var(--border-default)); color: #e77b77; }
+.plan-inline-message button { margin-left: auto; display: inline-flex; padding: 2px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+
+.plan-editor-overlay { position: fixed; z-index: 5000; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(10, 10, 9, 0.7); backdrop-filter: blur(7px); animation: fadeIn 0.12s ease; }
+.plan-editor-dialog { width: min(940px, calc(100vw - 48px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border-strong); border-radius: var(--radius-xl); background: var(--bg-surface); box-shadow: 0 28px 90px rgba(0, 0, 0, 0.55); }
+.plan-editor-head { display: flex; align-items: flex-start; justify-content: space-between; padding: 18px 20px 13px; border-bottom: 1px solid var(--border-subtle); }
+.plan-editor-head h2, .workspace-name-dialog h2 { margin: 3px 0 0; color: var(--text-primary); font: 20px/1.2 var(--font-serif); }
+.plan-editor-kicker { color: var(--accent-coral); font-size: 8px; font-weight: 700; letter-spacing: 0.9px; text-transform: uppercase; }
+.plan-icon-button { width: 28px; padding: 0; }
+.plan-editor-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 14px 20px; }
+.plan-field { display: flex; flex-direction: column; gap: 5px; }
+.plan-field-wide { grid-column: span 1; }
+.plan-field span { color: var(--text-tertiary); font-size: 9px; font-weight: 600; }
+.plan-editor-entries-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 0 20px 9px; }
+.plan-editor-entries-head > div:first-child { display: flex; flex-direction: column; gap: 3px; }
+.plan-editor-entries-head strong { color: var(--text-primary); font-size: 11px; }
+.plan-editor-entries-head span { color: var(--text-muted); font-size: 9px; }
+.plan-template-buttons { display: flex; gap: 3px; flex-wrap: wrap; justify-content: flex-end; }
+.plan-template-buttons button { border-color: var(--border-default); background: var(--bg-elevated); }
+.plan-json-editor { flex: 1; min-height: 300px; margin: 0 20px; resize: vertical; padding: 13px 15px; border: 1px solid var(--border-default); border-radius: var(--radius-md); outline: 0; background: #111210; color: #d8d4c8; caret-color: var(--accent-coral); font: 10px/1.55 "JetBrains Mono", var(--font-mono); tab-size: 2; }
+.plan-json-editor:focus { border-color: var(--focus-ring); }
+:root[data-theme="light"] .plan-json-editor { background: #242521; color: #f2eee2; }
+.plan-editor-hint { padding: 8px 20px 0; color: var(--text-muted); font-size: 9px; line-height: 1.5; }
+.plan-editor-hint code { color: var(--text-secondary); font-family: var(--font-mono); }
+.plan-editor-error { display: flex; align-items: flex-start; gap: 6px; margin: 8px 20px 0; padding: 7px 9px; border: 1px solid color-mix(in oklab, var(--error) 55%, var(--border-default)); border-radius: var(--radius-sm); background: color-mix(in oklab, var(--error) 8%, transparent); color: #e77b77; font-size: 9px; line-height: 1.45; }
+.plan-editor-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding: 14px 20px 18px; }
+.workspace-name-dialog { width: min(420px, calc(100vw - 40px)); padding: 22px; border: 1px solid var(--border-strong); border-radius: var(--radius-xl); background: var(--bg-surface); box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5); }
+.workspace-name-dialog p { margin: 8px 0 14px; color: var(--text-tertiary); font-size: 10px; line-height: 1.5; }
+.workspace-name-dialog input { width: 100%; box-sizing: border-box; }
+.workspace-name-dialog .plan-editor-actions { padding: 16px 0 0; }
+.ts-row-secondary { flex: 0 0 auto; padding: 3px 6px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-muted); font: 8px var(--font-sans); cursor: pointer; }
+.ts-row-secondary:hover { border-color: var(--accent-terracotta); color: var(--accent-coral); }
+
+@media (max-width: 760px) {
+  .terminal-search-overlay { left: 8px; right: 8px; }
+  .terminal-search-overlay input { width: 100%; min-width: 0; }
+  .terminal-search-results { min-width: 46px; }
+  .settings-row { flex-direction: column; gap: 8px; }
+  .settings-row-control { width: 100%; justify-content: flex-start; }
+  .settings-keybinding-control { align-items: flex-start; }
+  .settings-keybinding-error { text-align: left; }
+  .terminal-command-confirm { flex-direction: column; align-items: stretch; text-align: center; }
+  .terminal-command-confirm-mark { align-self: center; }
+  .plan-library-head, .plan-card { flex-direction: column; align-items: stretch; }
+  .plan-capture-row { width: 100%; }
+  .plan-capture-row input { flex: 1; width: auto; }
+  .plan-card-actions { justify-content: flex-start; }
+  .plan-editor-overlay { padding: 10px; }
+  .plan-editor-dialog { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
+  .plan-editor-fields { grid-template-columns: 1fr; }
+  .plan-editor-entries-head { align-items: flex-start; flex-direction: column; }
+  .plan-template-buttons { justify-content: flex-start; }
+  .plan-json-editor { min-height: 240px; }
+}
 
 /* ── Utilities ────────────────────────────────────────────────────── */
 

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot } from "lucide-react";
+import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot, Pin, PinOff, Pencil } from "lucide-react";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -13,6 +13,14 @@ import { useDragReorder } from "../hooks/useDragReorder";
 import { QuickActionsDialog } from "./QuickActionsDialog";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { useProjectImage } from "../hooks/useProjectImage";
+import type { InteractionSettings } from "../lib/interactionSettings";
+import { formatKeyChord, matchDigitKeyChord, matchesKeyChord, shouldIgnoreGlobalShortcut } from "../lib/keybindings";
+import {
+  aggregateTerminalActivities,
+  type ActivityByTabId,
+  type TerminalActivity,
+} from "../lib/terminalActivity";
+import type { LaunchRecipeV1, WorkspaceV1 } from "../lib/launchPlans";
 
 function tabInitials(name: string): string {
   const parts = name.replace(/[^a-zA-Z0-9\s\-_.]/g, "").split(/[\s\-_.]+/).filter(Boolean);
@@ -28,6 +36,26 @@ function TabProjectIcon({ iconValue, color, name, linked }: { iconValue?: string
   const cls = `tab-project-icon ${linked ? "tab-project-icon-linked" : ""}`;
   if (imgSrc) return <div className={cls}><img src={imgSrc} className="tab-project-img" alt="" /></div>;
   return <div className={cls} style={color ? { background: color } : undefined}>{iconValue || tabInitials(name)}</div>;
+}
+
+function activityLabel(activity: TerminalActivity): string {
+  if (activity.reason === "permission") return "Waiting for permission";
+  if (activity.reason === "input") return "Waiting for input";
+  if (activity.reason === "turn-complete") return "Turn complete";
+  if (activity.reason === "agent-failed" || activity.reason === "spawn-error") return "Agent failed";
+  if (activity.reason === "process-exit") return "Process exited";
+  return activity.phase[0].toUpperCase() + activity.phase.slice(1);
+}
+
+function ActivityIndicator({ activity, unreadCount = activity?.unread ? 1 : 0 }: { activity?: TerminalActivity; unreadCount?: number }) {
+  if (!activity) return null;
+  const label = `${activityLabel(activity)}${unreadCount > 0 ? `, ${unreadCount} unread` : ""}`;
+  return (
+    <span className={`tab-activity tab-activity-${activity.phase} ${unreadCount > 0 ? "tab-activity-unread" : ""}`} title={label} aria-label={label}>
+      <span className="tab-activity-dot" />
+      {unreadCount > 1 && <span className="tab-activity-count">{unreadCount}</span>}
+    </span>
+  );
 }
 
 // Tab bar shows tabs and groups interleaved. A group is one "entry" representing
@@ -49,6 +77,11 @@ interface TabBarProps {
   sidebarCollapsed: boolean;
   defaultShell: string;
   updateAvailable: boolean;
+  interactionSettings: InteractionSettings;
+  closedCount: number;
+  workspaces: WorkspaceV1[];
+  launchRecipes: LaunchRecipeV1[];
+  activities: ActivityByTabId;
   onExpandSidebar: () => void;
   onSelectTab: (id: string) => void;
   onCloseTab: (id: string) => void;
@@ -61,6 +94,11 @@ interface TabBarProps {
   onNewShell: (project: ProjectInfo | null, shellId: string, shellName: string) => void;
   onRenameTab: (tabId: string, name: string) => void;
   onRenameGroup: (groupId: string, name: string) => void;
+  onTogglePin: (entryId: string) => void;
+  onReopenClosed: () => void;
+  onSaveWorkspace: () => void;
+  onOpenWorkspace: (id: string, mode: "merge" | "replace") => void;
+  onRunRecipe: (id: string) => void;
   onGoHome: () => void;
   onOpenSettings: () => void;
   onToggleSidebar: () => void;
@@ -203,33 +241,42 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameTab, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, interactionSettings, closedCount, workspaces, launchRecipes, activities, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameTab, onRenameGroup, onTogglePin, onReopenClosed, onSaveWorkspace, onOpenWorkspace, onRunRecipe, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
   const highlightPath = hoveredProjectPath || linkedProjectPath || selectedProject?.path || null;
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
   const [tooltip, setTooltip] = useState<{ text: string; rect: DOMRect } | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
-  const shortcutLabel = isMac ? "⌘ K" : "Ctrl K";
+  const shortcutLabel = formatKeyChord(interactionSettings.quickActions, isMac ? "macos" : "windows");
+  const interactionSettingsRef = useRef(interactionSettings);
+  useEffect(() => { interactionSettingsRef.current = interactionSettings; }, [interactionSettings]);
 
-  // Global Cmd/Ctrl+K toggles the tab search dialog. Capture-phase + preventDefault so
-  // the active terminal (xterm) doesn't also see the keystroke as kill-to-end-of-line.
+  // Capture phase prevents a matched global action from leaking into the active PTY.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const mod = isMac ? e.metaKey : e.ctrlKey;
-      if (!mod || e.shiftKey || e.altKey) return;
-      if (e.key.toLowerCase() !== "k") return;
-      e.preventDefault();
-      e.stopPropagation();
-      setSearchOpen(v => !v);
+      if (shouldIgnoreGlobalShortcut(e)) return;
+      const settings = interactionSettingsRef.current;
+      if (matchesKeyChord(e, settings.quickActions)) {
+        e.preventDefault();
+        e.stopPropagation();
+        setSearchOpen(v => !v);
+        return;
+      }
+      if (matchesKeyChord(e, settings.reopenClosed) && closedCount > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        onReopenClosed();
+      }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [isMac]);
+  }, [closedCount, onReopenClosed]);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
   const [tabRenameDraft, setTabRenameDraft] = useState("");
+  const [entryMenu, setEntryMenu] = useState<{ id: string; kind: "tab" | "group"; x: number; y: number } | null>(null);
   const commitRename = () => {
     if (renamingGroupId) {
       const trimmed = renameDraft.trim();
@@ -245,15 +292,48 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
     setRenamingTabId(null);
   };
 
+  const beginEntryRename = useCallback((entry: TabBarEntry) => {
+    setEntryMenu(null);
+    setTooltip(null);
+    if (entry.kind === "group") {
+      setRenamingTabId(null);
+      setRenamingGroupId(entry.id);
+      setRenameDraft(entry.group.name);
+    } else {
+      const projectSettings = entry.tab.projectPath ? projectIcons[entry.tab.projectPath.toLowerCase()] : undefined;
+      const projectDisplayName = projectSettings?.customName || entry.tab.projectName || "";
+      const fallback = entry.tab.shellMode === "raw" ? (projectDisplayName || entry.tab.title) : entry.tab.title;
+      setRenamingGroupId(null);
+      setRenamingTabId(entry.id);
+      setTabRenameDraft(entry.tab.customTitle || fallback);
+    }
+  }, [projectIcons]);
+
+  useEffect(() => {
+    if (!entryMenu) return;
+    const close = () => setEntryMenu(null);
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [entryMenu]);
+
   // Alt+1..9 switches by the visible tab-bar order. A group occupies one slot, matching
   // what the user sees instead of exposing its individual panes as hidden shortcut slots.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.repeat || e.isComposing) return;
+      if (shouldIgnoreGlobalShortcut(e)) return;
       if (renamingGroupId || renamingTabId) return;
-      const match = /^Digit([1-9])$/.exec(e.code);
-      if (!match) return;
-      const entry = entries[Number(match[1]) - 1];
+      const slot = matchDigitKeyChord(e, interactionSettingsRef.current.quickSwitch);
+      if (!slot) return;
+      const entry = entries[slot - 1];
       if (!entry) return;
       e.preventDefault();
       e.stopPropagation();
@@ -356,14 +436,21 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             if (entry.kind === "group") {
               const g = entry.group;
               const leafCount = collectLeafIds(g.layout).length;
+              const groupActivities = collectLeafIds(g.layout)
+                .map(tabId => activities[tabId] ? { tabId, activity: activities[tabId] } : null)
+                .filter((entry): entry is { tabId: string; activity: TerminalActivity } => entry !== null);
+              const aggregate = groupActivities.length > 0 ? aggregateTerminalActivities(groupActivities) : null;
+              const representativeActivity = aggregate?.representativeTabId ? activities[aggregate.representativeTabId] : undefined;
               const isActive = g.id === activeTabId;
               const tooltipText = `${g.name} — ${leafCount} pane${leafCount === 1 ? "" : "s"}`;
               const isRenaming = renamingGroupId === g.id;
               const startRename = () => { setRenamingTabId(null); setRenamingGroupId(g.id); setRenameDraft(g.name); setTooltip(null); };
               return (
-                <div key={g.id} data-idx={i} className={`tab-item tab-group-item ${isActive ? "active" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isRenaming) onSelectTab(g.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); startRename(); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
+                <div key={g.id} data-idx={i} className={`tab-item tab-group-item ${isActive ? "active" : ""} ${g.pinned ? "tab-pinned" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (e.button === 0) onEntryPointerDown(e, i); }} onClick={() => { if (!isRenaming) onSelectTab(g.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setEntryMenu({ id: g.id, kind: "group", x: e.clientX, y: e.clientY }); setTooltip(null); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                   {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                   <Layers size={13} className="tab-group-icon" />
+                  {g.pinned && <Pin size={10} className="tab-pin-indicator" aria-label="Pinned" />}
+                  <ActivityIndicator activity={representativeActivity} unreadCount={aggregate?.unreadCount} />
                   <div className="tab-item-text">
                     {isRenaming ? (
                       <input autoFocus className="tab-group-rename-input" value={renameDraft} onChange={(e) => setRenameDraft(e.target.value)} onBlur={commitRename} onFocus={(e) => e.currentTarget.select()} onKeyDown={(e) => { if (e.key === "Enter") commitRename(); else if (e.key === "Escape") setRenamingGroupId(null); }} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} />
@@ -398,13 +485,15 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
               setTooltip(null);
             };
             return (
-              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (!isRenaming) onEntryPointerDown(e, i); }} onClick={() => { if (!isClosing && !isRenaming) onSelectTab(tab.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); startRename(); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
+              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${tab.pinned ? "tab-pinned" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (!isRenaming && e.button === 0) onEntryPointerDown(e, i); }} onClick={() => { if (!isClosing && !isRenaming) onSelectTab(tab.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setEntryMenu({ id: tab.id, kind: "tab", x: e.clientX, y: e.clientY }); setTooltip(null); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                 {isRawShell
                   ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
                   : projectDisplayName
                     ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} />
                     : <div className={`tab-dot ${matches ? "tab-dot-active" : ""}`} />}
+                {tab.pinned && <Pin size={10} className="tab-pin-indicator" aria-label="Pinned" />}
+                <ActivityIndicator activity={activities[tab.id]} />
                 <div className="tab-item-text">
                   {isRenaming ? (
                     <input autoFocus className="tab-rename-input" aria-label="Rename tab" value={tabRenameDraft} onChange={(e) => setTabRenameDraft(e.target.value)} onBlur={commitTabRename} onFocus={(e) => e.currentTarget.select()} onKeyDown={(e) => { if (e.key === "Enter") commitTabRename(); else if (e.key === "Escape") setRenamingTabId(null); }} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.stopPropagation()} />
@@ -427,6 +516,31 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
           <button className="tab-scroll-btn tab-scroll-right" onClick={() => scrollBy(200)}><ChevronRight size={12} /></button>
         )}
       </div>
+
+      {entryMenu && (() => {
+        const entry = entries.find(candidate => candidate.id === entryMenu.id);
+        if (!entry) return null;
+        const pinned = entry.kind === "group" ? entry.group.pinned === true : entry.tab.pinned === true;
+        return (
+          <div
+            className="tab-entry-menu"
+            role="menu"
+            aria-label={`${entry.kind === "group" ? "Group" : "Tab"} actions`}
+            style={{
+              left: Math.max(4, Math.min(entryMenu.x, window.innerWidth - 190)),
+              top: Math.max(4, Math.min(entryMenu.y, window.innerHeight - 132)),
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button type="button" role="menuitem" onClick={() => beginEntryRename(entry)}><Pencil size={13} /><span>Rename</span></button>
+            <button type="button" role="menuitem" onClick={() => { onTogglePin(entry.id); setEntryMenu(null); }}>
+              {pinned ? <PinOff size={13} /> : <Pin size={13} />}<span>{pinned ? "Unpin" : "Pin"}</span>
+            </button>
+            <button type="button" role="menuitem" disabled={pinned} onClick={() => { onCloseTab(entry.id); setEntryMenu(null); }}><X size={13} /><span>Close</span></button>
+          </div>
+        );
+      })()}
 
       {(() => {
         const activeDisplayName = activeTabProject ? (projectIcons[activeTabProject.path.toLowerCase()]?.customName || activeTabProject.name) : null;
@@ -484,10 +598,17 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
           hoveredProjectPath={hoveredProjectPath}
           linkedProjectPath={linkedProjectPath}
           selectedProjectPath={selectedProject?.path || null}
-          hasActiveTab={!!tabs.find(t => t.id === activeTabId)}
+          hasActiveTab={entries.some(entry => entry.id === activeTabId)}
+          closedCount={closedCount}
+          workspaces={workspaces}
+          launchRecipes={launchRecipes}
           installedAgents={installedAgents}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
+          onReopenClosed={onReopenClosed}
+          onSaveWorkspace={onSaveWorkspace}
+          onOpenWorkspace={onOpenWorkspace}
+          onRunRecipe={onRunRecipe}
           onNewChat={onNewChat}
           onNewShell={onNewShell}
           onGoHome={onGoHome}

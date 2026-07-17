@@ -270,7 +270,7 @@ export function DetailedSessionInfoWizard({ onClose }: Props) {
 
   return (
     <div className="settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="settings-panel dsi-panel">
+      <div className="settings-panel dsi-panel" role="dialog" aria-modal="true" aria-label="Detailed session info">
         <div className="settings-header">
           <span>Detailed session info</span>
           <button className="settings-close" onClick={onClose} aria-label="Close" {...ttProps(tt, "Close")}><X size={14} /></button>
