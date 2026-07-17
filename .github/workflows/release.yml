@@ -59,14 +59,16 @@ jobs:
         run: npm ci
 
       - name: Build and publish (Tauri)
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Keep this defined even for a passwordless key so the signer does not prompt.
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'xshell ${{ github.ref_name }}'
+          tagName: 'v__VERSION__'
+          releaseName: 'xshell v__VERSION__'
           releaseBody: |
             See the assets below to download and install this version.
 
@@ -85,6 +87,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.tauri.outputs.appVersion }}"
           cp src-tauri/target/release/xshell.exe "xshell_${VERSION}_x64.exe"
-          gh release upload "${GITHUB_REF_NAME}" "xshell_${VERSION}_x64.exe" --clobber
+          gh release upload "v${VERSION}" "xshell_${VERSION}_x64.exe" --clobber

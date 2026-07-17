@@ -41,9 +41,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI1OUMwNjYzMjJFOEFCMkYKUldRdnErZ2lZd2FjSlkyTmliN3ZtYm81VmY1elA1YjBUeXp6NDFwRkszVmJEWmxPYmNJMk1ROG8K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDODBFMURDQkVCNkFGRUEKUldUcXI3YSszT0dBWEFRRG1EL0NleS9QU0N0enk2aTBoeVFRL0pNVWo5ZTVvVkk2NncvUDFHT0QK",
       "endpoints": [
-        "https://github.com/MertPROJ/xshell/releases/latest/download/latest.json"
+        "https://github.com/Leonui/xshell-dev-win/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
