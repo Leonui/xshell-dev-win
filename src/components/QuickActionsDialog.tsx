@@ -97,7 +97,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
     return sortedTabs.filter(t => {
       const customName = t.projectPath ? projectIcons[t.projectPath.toLowerCase()]?.customName : undefined;
       const projDisplayName = customName || t.projectName || "";
-      const haystack = `${t.title} ${projDisplayName} ${t.shellId || ""}`.toLowerCase();
+      const haystack = `${t.customTitle || ""} ${t.title} ${projDisplayName} ${t.shellId || ""}`.toLowerCase();
       return haystack.includes(q);
     });
   }, [sortedTabs, query, projectIcons]);
@@ -261,8 +261,9 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
             const customName = settings?.customName;
             const projDisplayName = customName || tab.projectName || (tab.projectPath ? "" : "~");
             const isRawShell = tab.shellMode === "raw";
-            const displayTitle = isRawShell ? (projDisplayName || tab.title) : tab.title;
-            const displaySubtitle = isRawShell ? tab.title : projDisplayName;
+            const defaultTitle = isRawShell ? (projDisplayName || tab.title) : tab.title;
+            const displayTitle = tab.customTitle || defaultTitle;
+            const displaySubtitle = tab.customTitle ? "" : (isRawShell ? tab.title : projDisplayName);
             const matches = !!highlightPath && tab.projectPath && tab.projectPath.toLowerCase() === highlightPath;
             const showDivider = i > 0 && i === firstRawIdx;
             return (

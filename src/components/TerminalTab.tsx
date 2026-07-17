@@ -288,6 +288,18 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     } catch (_) {}
   }, []);
 
+  const pasteTerminalSelectionOrClipboard = useCallback(async () => {
+    // Capture first: focusing or forwarding the mouse event can otherwise change xterm's selection.
+    const selection = terminalRef.current?.getSelection() ?? "";
+    if (!selection) {
+      await pasteTerminalClipboard();
+      return;
+    }
+
+    try { await navigator.clipboard.writeText(selection); } catch (_) {}
+    terminalRef.current?.paste(selection);
+  }, [pasteTerminalClipboard]);
+
   const openTerminalContextMenu = useCallback((ev: React.MouseEvent<HTMLDivElement>) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -389,7 +401,13 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    term.loadAddon(new WebLinksAddon());
+    // Route terminal links through the native system-browser command. The addon's default
+    // window.open() handler is unreliable inside a Tauri webview; the Rust command also
+    // rejects every scheme except http(s).
+    term.loadAddon(new WebLinksAddon((event, url) => {
+      event.preventDefault();
+      void invoke("open_url", { url }).catch(() => {});
+    }));
 
     // Unicode 11 width tables. xterm defaults to Unicode v6, which gets the cell width of
     // emoji and many wide chars wrong (status-line icons like 📁, box drawing, CJK) — so text
@@ -1059,9 +1077,22 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           style={{ background: paletteFor(theme, terminalBgColor).background }}
           onContextMenu={openTerminalContextMenu}
           onMouseDownCapture={(e) => {
-            // Stop right-button mouse reporting before xterm forwards it to an agent TUI.
-            // The subsequent contextmenu event opens xshell's clipboard menu instead.
+            // Stop right-button mouse reporting before xterm forwards it to an agent TUI;
+            // the subsequent contextmenu event opens xshell's clipboard menu instead.
             if (e.button === 2) { e.preventDefault(); e.stopPropagation(); }
+            // With a selection, middle-click first copies and then pastes that exact text.
+            // Otherwise it pastes the existing clipboard. Capture prevents a mouse-aware agent
+            // TUI from receiving the same button press.
+            if (e.button === 1) {
+              e.preventDefault();
+              e.stopPropagation();
+              void pasteTerminalSelectionOrClipboard();
+              focusTerminal();
+            }
+          }}
+          onAuxClick={(e) => {
+            // Suppress browser autoscroll/new-tab behavior after the handled middle press.
+            if (e.button === 1) { e.preventDefault(); e.stopPropagation(); }
           }}
           onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_PATH_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
           onDrop={(e) => {

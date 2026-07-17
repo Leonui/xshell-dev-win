@@ -59,6 +59,7 @@ interface TabBarProps {
   onNewShellInContext: () => void;
   onOpenSession: (session: SessionInfo, project: ProjectInfo) => void;
   onNewShell: (project: ProjectInfo | null, shellId: string, shellName: string) => void;
+  onRenameTab: (tabId: string, name: string) => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onGoHome: () => void;
   onOpenSettings: () => void;
@@ -202,7 +203,7 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameTab, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
   const highlightPath = hoveredProjectPath || linkedProjectPath || selectedProject?.path || null;
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
@@ -227,6 +228,8 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
   }, [isMac]);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+  const [tabRenameDraft, setTabRenameDraft] = useState("");
   const commitRename = () => {
     if (renamingGroupId) {
       const trimmed = renameDraft.trim();
@@ -234,6 +237,33 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
     }
     setRenamingGroupId(null);
   };
+  const commitTabRename = () => {
+    if (renamingTabId) {
+      const trimmed = tabRenameDraft.trim();
+      if (trimmed) onRenameTab(renamingTabId, trimmed);
+    }
+    setRenamingTabId(null);
+  };
+
+  // Alt+1..9 switches by the visible tab-bar order. A group occupies one slot, matching
+  // what the user sees instead of exposing its individual panes as hidden shortcut slots.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.repeat || e.isComposing) return;
+      if (renamingGroupId || renamingTabId) return;
+      const match = /^Digit([1-9])$/.exec(e.code);
+      if (!match) return;
+      const entry = entries[Number(match[1]) - 1];
+      if (!entry) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setSearchOpen(false);
+      setDropdown(null);
+      onSelectTab(entry.id);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [entries, onSelectTab, renamingGroupId, renamingTabId]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [overflow, setOverflow] = useState({ left: false, right: false });
 
@@ -329,14 +359,14 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
               const isActive = g.id === activeTabId;
               const tooltipText = `${g.name} — ${leafCount} pane${leafCount === 1 ? "" : "s"}`;
               const isRenaming = renamingGroupId === g.id;
-              const startRename = () => { setRenamingGroupId(g.id); setRenameDraft(g.name); setTooltip(null); };
+              const startRename = () => { setRenamingTabId(null); setRenamingGroupId(g.id); setRenameDraft(g.name); setTooltip(null); };
               return (
                 <div key={g.id} data-idx={i} className={`tab-item tab-group-item ${isActive ? "active" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isRenaming) onSelectTab(g.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); startRename(); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                   {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                   <Layers size={13} className="tab-group-icon" />
                   <div className="tab-item-text">
                     {isRenaming ? (
-                      <input autoFocus className="tab-group-rename-input" value={renameDraft} onChange={(e) => setRenameDraft(e.target.value)} onBlur={commitRename} onKeyDown={(e) => { if (e.key === "Enter") commitRename(); else if (e.key === "Escape") setRenamingGroupId(null); }} onClick={(e) => e.stopPropagation()} />
+                      <input autoFocus className="tab-group-rename-input" value={renameDraft} onChange={(e) => setRenameDraft(e.target.value)} onBlur={commitRename} onFocus={(e) => e.currentTarget.select()} onKeyDown={(e) => { if (e.key === "Enter") commitRename(); else if (e.key === "Escape") setRenamingGroupId(null); }} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} />
                     ) : (
                       <span className="tab-item-title truncate">{g.name}</span>
                     )}
@@ -356,11 +386,19 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const customName = projectSettings?.customName;
             const projectDisplayName = customName || tab.projectName || "";
             const isRawShell = tab.shellMode === "raw";
-            const displayTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
-            const displaySubtitle = isRawShell ? tab.title : projectDisplayName;
+            const defaultTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
+            const displayTitle = tab.customTitle || defaultTitle;
+            const displaySubtitle = tab.customTitle ? "" : (isRawShell ? tab.title : projectDisplayName);
             const tooltipText = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const isRenaming = renamingTabId === tab.id;
+            const startRename = () => {
+              setRenamingGroupId(null);
+              setRenamingTabId(tab.id);
+              setTabRenameDraft(displayTitle);
+              setTooltip(null);
+            };
             return (
-              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
+              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (!isRenaming) onEntryPointerDown(e, i); }} onClick={() => { if (!isClosing && !isRenaming) onSelectTab(tab.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); startRename(); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                 {isRawShell
                   ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
@@ -368,8 +406,14 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
                     ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} />
                     : <div className={`tab-dot ${matches ? "tab-dot-active" : ""}`} />}
                 <div className="tab-item-text">
-                  <span className="tab-item-title truncate">{displayTitle}</span>
-                  {displaySubtitle && <span className="tab-item-project">{displaySubtitle}</span>}
+                  {isRenaming ? (
+                    <input autoFocus className="tab-rename-input" aria-label="Rename tab" value={tabRenameDraft} onChange={(e) => setTabRenameDraft(e.target.value)} onBlur={commitTabRename} onFocus={(e) => e.currentTarget.select()} onKeyDown={(e) => { if (e.key === "Enter") commitTabRename(); else if (e.key === "Escape") setRenamingTabId(null); }} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.stopPropagation()} />
+                  ) : (
+                    <>
+                      <span className="tab-item-title truncate">{displayTitle}</span>
+                      {displaySubtitle && <span className="tab-item-project">{displaySubtitle}</span>}
+                    </>
+                  )}
                 </div>
                 <div className="tab-item-close" onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }}>
                   <X size={11} />

@@ -283,6 +283,7 @@ export interface Tab {
   id: string;
   type: 'home' | 'terminal';
   title: string;
+  customTitle?: string; // user-defined tab label; `title` remains free to track the underlying session
   sessionId?: string;
   projectPath?: string;
   projectName?: string;

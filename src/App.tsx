@@ -1122,6 +1122,10 @@ export default function App() {
     }
   }, []);
 
+  const handleRenameTab = useCallback((id: string, name: string) => {
+    setTabs(prev => prev.map(tab => tab.id === id && tab.customTitle !== name ? { ...tab, customTitle: name } : tab));
+  }, []);
+
   return (
     <div className={`app-layout ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       {/* Boot splash — full-window, screen-centered, drawn above everything (incl. the sidebar)
@@ -1132,7 +1136,7 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar tabs={tabs} entries={entries} onRenameTab={handleRenameTab} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(p) => setEditingProjectPath(p)} onHoverProject={setHoveredProjectPath} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectPath={activeTabProjectPath} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
