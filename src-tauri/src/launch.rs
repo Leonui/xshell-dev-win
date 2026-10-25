@@ -321,6 +321,8 @@ fn executable_file(path: &Path, allow_windows_batch: bool) -> bool {
             || (allow_windows_batch
                 && (extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")))
     }
+    #[cfg(not(windows))]
+    let _ = allow_windows_batch;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -348,7 +350,7 @@ fn executable_exists(command: &str) -> bool {
         vec![".exe".to_string(), ".com".to_string()]
     };
     #[cfg(not(windows))]
-    let extensions = vec![String::new()];
+    let extensions = [String::new()];
 
     std::env::split_paths(&path_value).any(|directory| {
         extensions.iter().any(|extension| {

@@ -92,6 +92,12 @@ fn location_arg(path: &Path, line: Option<u32>, column: Option<u32>) -> String {
     }
 }
 
+// Linux has no well-known install directories; `preset` and the `mut` are only exercised on
+// Windows and macOS.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos")),
+    allow(unused_mut, unused_variables)
+)]
 fn known_editor_candidates(preset: EditorPreset) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(target_os = "windows")]

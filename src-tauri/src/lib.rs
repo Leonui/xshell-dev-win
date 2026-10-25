@@ -2980,19 +2980,9 @@ fn resolve_batch_script(bin: &str) -> Option<String> {
     std::env::var_os("PATH").and_then(|path| find_batch_script_in_path(bin, &path))
 }
 
-#[cfg(not(windows))]
-fn resolve_batch_script(_bin: &str) -> Option<String> {
-    None
-}
-
 #[cfg(windows)]
 fn resolve_native_executable(bin: &str) -> Option<String> {
     std::env::var_os("PATH").and_then(|path| find_native_executable_in_path(bin, &path))
-}
-
-#[cfg(not(windows))]
-fn resolve_native_executable(_bin: &str) -> Option<String> {
-    None
 }
 
 #[cfg(not(windows))]
@@ -4229,8 +4219,8 @@ fn get_codex_usage() -> CodexUsage {
         let Some(rl) = payload.get("rate_limits") else {
             continue;
         };
-        out.primary = rl.get("primary").map(&parse_window);
-        out.secondary = rl.get("secondary").map(&parse_window);
+        out.primary = rl.get("primary").map(parse_window);
+        out.secondary = rl.get("secondary").map(parse_window);
         out.plan_type = rl
             .get("plan_type")
             .and_then(|v| v.as_str())
