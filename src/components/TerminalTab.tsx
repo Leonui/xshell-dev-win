@@ -551,19 +551,6 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    // OSC 52 — tmux (set-clipboard on), neovim, gh and CLI login flows use this escape
-    // sequence to ask the terminal to put text on the system clipboard. xterm.js parses it
-    // but doesn't act on it by default (writing to the clipboard is left to the embedder) —
-    // without this handler those "press c to copy" prompts print success but never copy.
-    term.parser.registerOscHandler(52, (data) => {
-      const payload = data.split(";")[1];
-      if (!payload) return true;
-      try {
-        const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
-        navigator.clipboard.writeText(new TextDecoder().decode(bytes)).catch(() => {});
-      } catch (_) { /* malformed base64 — ignore */ }
-      return true;
-    });
     const searchAddon = new SearchAddon({ highlightLimit: 2000 });
     term.loadAddon(searchAddon);
     searchAddonRef.current = searchAddon;

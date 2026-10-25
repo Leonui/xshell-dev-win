@@ -6,6 +6,7 @@ import {
   isEditableShortcutTarget,
   matchDigitKeyChord,
   matchesKeyChord,
+  modifiersHeldFor,
   sanitizeKeyChord,
   shouldIgnoreGlobalShortcut,
   type KeyChord,
@@ -76,6 +77,30 @@ describe("key chord matching", () => {
     expect(matchDigitKeyChord(keyEvent({ code: "Digit0", altKey: true }), altDigits)).toBeNull();
     expect(matchDigitKeyChord(keyEvent({ code: "Numpad1", altKey: true }), altDigits)).toBeNull();
     expect(matchDigitKeyChord(keyEvent({ code: "Digit1", altKey: true, ctrlKey: true }), altDigits)).toBeNull();
+  });
+
+  it("reports when exactly the quick-switch modifiers are held", () => {
+    expect(modifiersHeldFor(keyEvent({ code: "AltLeft", altKey: true }), altDigits)).toBe(true);
+    expect(modifiersHeldFor(keyEvent({ code: "Digit3", altKey: true }), altDigits)).toBe(true);
+    expect(modifiersHeldFor(keyEvent({ code: "AltLeft" }), altDigits)).toBe(false);
+    expect(modifiersHeldFor(keyEvent({ code: "ShiftLeft", altKey: true, shiftKey: true }), altDigits)).toBe(false);
+    expect(modifiersHeldFor(keyEvent({ code: "ControlLeft", altKey: true, ctrlKey: true }), altDigits)).toBe(false);
+  });
+
+  it("follows a reconfigured quick-switch chord", () => {
+    const ctrlShiftDigits: KeyChord = { code: DIGIT_KEY_TEMPLATE, ctrl: true, alt: false, shift: true, meta: false };
+    expect(modifiersHeldFor(keyEvent({ code: "ShiftLeft", ctrlKey: true, shiftKey: true }), ctrlShiftDigits)).toBe(true);
+    expect(modifiersHeldFor(keyEvent({ code: "ControlLeft", ctrlKey: true }), ctrlShiftDigits)).toBe(false);
+    expect(modifiersHeldFor(keyEvent({ code: "AltLeft", altKey: true }), ctrlShiftDigits)).toBe(false);
+    expect(modifiersHeldFor(keyEvent({ code: "MetaLeft", ctrlKey: true, shiftKey: true, metaKey: true }), ctrlShiftDigits)).toBe(false);
+  });
+
+  it("does not treat AltGr or modifier-less chords as held", () => {
+    const ctrlAltDigits: KeyChord = { code: DIGIT_KEY_TEMPLATE, ctrl: true, alt: true, shift: false, meta: false };
+    const altGr = keyEvent({ code: "AltRight", ctrlKey: true, altKey: true, getModifierState: (key) => key === "AltGraph" });
+    expect(modifiersHeldFor(altGr, ctrlAltDigits)).toBe(false);
+    const bare: KeyChord = { code: DIGIT_KEY_TEMPLATE, ctrl: false, alt: false, shift: false, meta: false };
+    expect(modifiersHeldFor(keyEvent({ code: "Digit1" }), bare)).toBe(false);
   });
 });
 

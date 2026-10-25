@@ -287,12 +287,18 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .tab-project-img { width: 100%; height: 100%; object-fit: cover; border-radius: 5px; -webkit-user-drag: none; user-select: none; pointer-events: none; }
 .tab-project-icon-linked { box-shadow: 0 0 0 1.5px var(--bg-surface), 0 0 0 3px var(--success); }
 
+/* Quick-switch slot number, overlaid on the leading icon while the quick-switch modifiers are held.
+   The wrapper is sized by the icon itself, so the badge never shifts the tab layout. */
+.tab-icon-slot { position: relative; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.tab-icon-slot-shell { margin-right: 2px; }
+.tab-slot-badge { position: absolute; top: 50%; left: 50%; width: 16px; height: 16px; transform: translate(-50%, -50%); border-radius: 5px; background: var(--text-primary); color: var(--bg-surface); box-shadow: 0 0 0 1px var(--tab-bg); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1; pointer-events: none; user-select: none; z-index: 1; }
+
 /* A transparent top+side border on every tab (open at the bottom, like a real tab) keeps layout stable;
    the active tab simply colours it in, which outlines its rounded shape crisply against the bar. */
-.tab-item { display: flex; align-items: center; gap: 6px; padding: 4px 10px; margin-top: 4px; font-size: 11px; color: var(--text-tertiary); cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease, max-width 0.18s ease, opacity 0.18s ease, padding 0.18s ease; white-space: nowrap; flex: 1 1 auto; min-width: 100px; max-width: 220px; overflow: hidden; animation: tabIn 0.18s cubic-bezier(0.2, 0, 0, 1); }
+.tab-item { --tab-bg: var(--bg-surface); display: flex; align-items: center; gap: 6px; padding: 4px 10px; margin-top: 4px; font-size: 11px; color: var(--text-tertiary); cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease, max-width 0.18s ease, opacity 0.18s ease, padding 0.18s ease; white-space: nowrap; flex: 1 1 auto; min-width: 100px; max-width: 220px; overflow: hidden; animation: tabIn 0.18s cubic-bezier(0.2, 0, 0, 1); }
 .tab-item:hover { color: var(--text-secondary); background: rgba(255, 255, 255, 0.04); }
 /* Active tab = darker fill (opens into the content) + a hairline outline so its rounded shape stays legible against the bar. */
-.tab-item.active { color: var(--text-primary); background: var(--bg-deep); border-color: var(--border-strong); }
+.tab-item.active { --tab-bg: var(--bg-deep); color: var(--text-primary); background: var(--bg-deep); border-color: var(--border-strong); }
 .tab-item.active:hover { background: var(--bg-deep); }
 .tab-closing { max-width: 0 !important; min-width: 0 !important; padding-left: 0 !important; padding-right: 0 !important; opacity: 0; pointer-events: none; flex: 0 0 0 !important; }
 
@@ -349,7 +355,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .tab-dropdown-icon { color: var(--text-muted); flex-shrink: 0; }
 .tab-dropdown-shell-icon { color: var(--accent-coral); flex-shrink: 0; }
 .tab-dropdown-divider { height: 1px; background: var(--border-subtle); margin: 4px 0; }
-.tab-shell-icon { flex-shrink: 0; margin-right: 2px; border-radius: 3px; }
+.tab-shell-icon { flex-shrink: 0; border-radius: 3px; }
 
 /* Collapsible dropdown group (e.g. Shells submenu) */
 .tab-dropdown-group-header { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-radius: var(--radius-sm); cursor: pointer; user-select: none; color: var(--text-secondary); font-size: 11px; transition: background 0.1s, color 0.1s; }

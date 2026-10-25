@@ -101,6 +101,11 @@ export function isAltGraphEvent(event: KeyEventLike): boolean {
   }
 }
 
+/** True for a modifier key's own press/release, whose event already reflects the new state. */
+export function isModifierKeyEvent(event: KeyEventLike): boolean {
+  return MODIFIER_CODES.has(event.code);
+}
+
 export function shouldIgnoreKeyEvent(event: KeyEventLike, options: KeyMatchOptions = {}): boolean {
   if (!options.allowRepeat && event.repeat) return true;
   if (!options.allowComposing && (event.isComposing || event.keyCode === 229)) return true;
@@ -118,6 +123,16 @@ function modifiersMatch(event: KeyEventLike, chord: KeyChord): boolean {
 export function matchesKeyChord(event: KeyEventLike, chord: KeyChord, options: KeyMatchOptions = {}): boolean {
   if (chord.code === DIGIT_KEY_TEMPLATE || shouldIgnoreKeyEvent(event, options)) return false;
   return event.code === chord.code && modifiersMatch(event, chord);
+}
+
+/**
+ * True when the held modifier set is exactly the chord's (e.g. to preview quick-switch slots
+ * before a digit is pressed). AltGr is rejected like in the matchers, and a chord without
+ * modifiers never counts as held.
+ */
+export function modifiersHeldFor(event: KeyEventLike, chord: KeyChord): boolean {
+  if (!(chord.ctrl || chord.alt || chord.shift || chord.meta) || isAltGraphEvent(event)) return false;
+  return modifiersMatch(event, chord);
 }
 
 /** Returns the 1-based quick-switch slot, or null when the digit template does not match. */

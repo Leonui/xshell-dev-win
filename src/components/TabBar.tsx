@@ -14,7 +14,8 @@ import { QuickActionsDialog } from "./QuickActionsDialog";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { useProjectImage } from "../hooks/useProjectImage";
 import type { InteractionSettings } from "../lib/interactionSettings";
-import { formatKeyChord, matchDigitKeyChord, matchesKeyChord, shouldIgnoreGlobalShortcut } from "../lib/keybindings";
+import { formatKeyChord, isModifierKeyEvent, matchDigitKeyChord, matchesKeyChord, modifiersHeldFor, shouldIgnoreGlobalShortcut } from "../lib/keybindings";
+import type { KeyEventLike } from "../lib/keybindings";
 import {
   aggregateTerminalActivities,
   type ActivityByTabId,
@@ -325,12 +326,22 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
     };
   }, [entryMenu]);
 
+  // One definition of "quick-switch is usable right now", shared by the digit handler and the
+  // slot-number preview so the overlay can never advertise slots the shortcut would refuse.
+  const isRenamingEntry = renamingGroupId !== null || renamingTabId !== null;
+  const quickSwitchAvailable = useCallback((e: KeyEventLike) => {
+    if (isRenamingEntry) return false;
+    const chord = interactionSettingsRef.current.quickSwitch;
+    // Check the pure modifier state first so the DOM queries in shouldIgnoreGlobalShortcut only
+    // run for keystrokes that are actually part of the chord.
+    return modifiersHeldFor(e, chord) && !shouldIgnoreGlobalShortcut(e, { allowRepeat: true });
+  }, [isRenamingEntry]);
+
   // Alt+1..9 switches by the visible tab-bar order. A group occupies one slot, matching
   // what the user sees instead of exposing its individual panes as hidden shortcut slots.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (shouldIgnoreGlobalShortcut(e)) return;
-      if (renamingGroupId || renamingTabId) return;
+      if (!quickSwitchAvailable(e)) return;
       const slot = matchDigitKeyChord(e, interactionSettingsRef.current.quickSwitch);
       if (!slot) return;
       const entry = entries[slot - 1];
@@ -343,7 +354,66 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [entries, onSelectTab, renamingGroupId, renamingTabId]);
+  }, [entries, onSelectTab, quickSwitchAvailable]);
+
+  // Overlay slot numbers while the quick-switch modifiers are held and no other key has been
+  // pressed since. Keyup reports the post-release modifier state. Pointer presses and focus
+  // changes dismiss the overlay because attention moved to another target; window blur and
+  // visibility changes cover modifier releases that happen outside this window, where the
+  // matching keyup goes to a native popup or another app instead of reaching us.
+  const [quickSwitchHeld, setQuickSwitchHeld] = useState(false);
+  // Set once a non-digit key is pressed while the chord is held (Alt+B in readline,
+  // Ctrl+Shift+C in the terminal). The preview then stays off until the modifiers are released.
+  const quickSwitchUsedChordRef = useRef(false);
+  useEffect(() => {
+    const release = () => {
+      quickSwitchUsedChordRef.current = false;
+      setQuickSwitchHeld(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!quickSwitchAvailable(e)) { release(); return; }
+      if (isModifierKeyEvent(e)) {
+        if (!quickSwitchUsedChordRef.current) setQuickSwitchHeld(true);
+        return;
+      }
+      // Digits are what the overlay advertises, so pressing one keeps the preview up; any
+      // other key means the user is typing with the chord, not reaching for a slot.
+      if (matchDigitKeyChord(e, interactionSettingsRef.current.quickSwitch, { allowRepeat: true }) !== null) return;
+      quickSwitchUsedChordRef.current = true;
+      setQuickSwitchHeld(false);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (!quickSwitchAvailable(e)) { release(); return; }
+      setQuickSwitchHeld(!quickSwitchUsedChordRef.current);
+    };
+    const onVisibility = () => { if (document.hidden) release(); };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("blur", release);
+    window.addEventListener("pointerdown", release, true);
+    window.addEventListener("focusin", release, true);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("blur", release);
+      window.removeEventListener("pointerdown", release, true);
+      window.removeEventListener("focusin", release, true);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [quickSwitchAvailable]);
+
+  // Renaming blocks new previews through quickSwitchAvailable; clear the state as well so the
+  // overlay cannot reappear when a rename ends with the modifiers still held.
+  useEffect(() => {
+    if (isRenamingEntry) setQuickSwitchHeld(false);
+  }, [isRenamingEntry]);
+
+  const showSlotBadges = quickSwitchHeld;
+  const slotBadge = (i: number) => showSlotBadges && i < 9
+    ? <span className="tab-slot-badge" aria-hidden="true">{i + 1}</span>
+    : null;
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const [overflow, setOverflow] = useState({ left: false, right: false });
 
@@ -448,7 +518,10 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
               return (
                 <div key={g.id} data-idx={i} className={`tab-item tab-group-item ${isActive ? "active" : ""} ${g.pinned ? "tab-pinned" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (e.button === 0) onEntryPointerDown(e, i); }} onClick={() => { if (!isRenaming) onSelectTab(g.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setEntryMenu({ id: g.id, kind: "group", x: e.clientX, y: e.clientY }); setTooltip(null); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                   {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
-                  <Layers size={13} className="tab-group-icon" />
+                  <div className="tab-icon-slot">
+                    <Layers size={13} className="tab-group-icon" />
+                    {slotBadge(i)}
+                  </div>
                   {g.pinned && <Pin size={10} className="tab-pin-indicator" aria-label="Pinned" />}
                   <ActivityIndicator activity={representativeActivity} unreadCount={aggregate?.unreadCount} />
                   <div className="tab-item-text">
@@ -487,11 +560,14 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             return (
               <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${tab.pinned ? "tab-pinned" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (!isRenaming && e.button === 0) onEntryPointerDown(e, i); }} onClick={() => { if (!isClosing && !isRenaming) onSelectTab(tab.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setEntryMenu({ id: tab.id, kind: "tab", x: e.clientX, y: e.clientY }); setTooltip(null); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
-                {isRawShell
-                  ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
-                  : projectDisplayName
-                    ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} />
-                    : <div className={`tab-dot ${matches ? "tab-dot-active" : ""}`} />}
+                <div className={`tab-icon-slot${isRawShell ? " tab-icon-slot-shell" : ""}`}>
+                  {isRawShell
+                    ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
+                    : projectDisplayName
+                      ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} />
+                      : <div className={`tab-dot ${matches ? "tab-dot-active" : ""}`} />}
+                  {slotBadge(i)}
+                </div>
                 {tab.pinned && <Pin size={10} className="tab-pin-indicator" aria-label="Pinned" />}
                 <ActivityIndicator activity={activities[tab.id]} />
                 <div className="tab-item-text">
