@@ -8,6 +8,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Copy, ClipboardPaste, TextSelect } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
@@ -519,6 +520,10 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
+    // OSC 52 support: tmux (set-clipboard on), neovim and remote shells copy by emitting
+    // ESC ] 52 ; c ; <base64> BEL. xterm.js ignores the sequence unless an addon claims it;
+    // this one decodes it and writes to the system clipboard via navigator.clipboard.
+    term.loadAddon(new ClipboardAddon());
     const searchAddon = new SearchAddon({ highlightLimit: 2000 });
     term.loadAddon(searchAddon);
     searchAddonRef.current = searchAddon;
