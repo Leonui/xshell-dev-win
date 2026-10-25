@@ -84,7 +84,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           # The wrapper verifies the exact updater artifacts before tauri-action can upload them.
-          tauriScript: npm run tauri:verified --
+          tauriScript: npm run tauri:verified
           tagName: 'v__VERSION__'
           releaseName: 'xshell v__VERSION__'
           releaseBody: |
