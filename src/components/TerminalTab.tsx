@@ -8,7 +8,6 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
-import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Copy, ClipboardPaste, TextSelect } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
@@ -32,6 +31,21 @@ const MAX_FONT_SIZE = 32;
 // normal/bold scales with the user's pick. Capped at 900 (the heaviest CSS weight).
 const BOLD_OFFSET = 200;
 const MAX_FONT_WEIGHT = 900;
+
+// Mirrors MAX_DROPPED_FILE_BYTES in src-tauri/src/lib.rs — checked here too so an
+// oversized clipboard image/drop never even gets read and base64-encoded.
+const MAX_DROPPED_FILE_BYTES = 25 * 1024 * 1024;
+
+// Native FileReader does the base64 encoding off the JS main thread — far cheaper than
+// building a JSON number array (~4x the byte count) or hand-rolling btoa over a big buffer.
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve((reader.result as string).split(",")[1] ?? "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
 
 // Default xterm bg per app theme. Exported so SettingsView's "Reset" button can fall
 // back to the right shade per theme, and so App.tsx can detect "user is on default"
@@ -320,7 +334,24 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     try { navigator.clipboard.writeText(text).catch(() => {}); } catch (_) {}
   }, []);
 
+  // Paste: if the clipboard holds an image (e.g. a screenshot, which Windows auto-copies on
+  // capture), save it to a real file and type its path instead of raw bytes — shells/CLIs
+  // take a file path, not an image blob. Falls back to plain text via term.paste(), whose
+  // bracketed-paste escapes keep multi-line text as one block.
   const pasteTerminalClipboard = useCallback(async () => {
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const imgType = item.types.find((t) => t.startsWith("image/"));
+        if (!imgType) continue;
+        const blob = await item.getType(imgType);
+        if (blob.size > MAX_DROPPED_FILE_BYTES) throw new Error("clipboard image too large");
+        const ext = imgType.split("/")[1] || "png";
+        const path = await invoke<string>("save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
+        invoke("write_terminal", { id: tabRef.current.id, data: /\s/.test(path) ? `"${path}" ` : `${path} ` }).catch(() => {});
+        return;
+      }
+    } catch (_) { /* clipboard.read() unsupported/denied, no image item, or too large — fall back to text */ }
     try {
       const text = await navigator.clipboard.readText();
       if (text) terminalRef.current?.paste(text);
@@ -520,20 +551,33 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    // OSC 52 support: tmux (set-clipboard on), neovim and remote shells copy by emitting
-    // ESC ] 52 ; c ; <base64> BEL. xterm.js ignores the sequence unless an addon claims it;
-    // this one decodes it and writes to the system clipboard via navigator.clipboard.
-    term.loadAddon(new ClipboardAddon());
+    // OSC 52 — tmux (set-clipboard on), neovim, gh and CLI login flows use this escape
+    // sequence to ask the terminal to put text on the system clipboard. xterm.js parses it
+    // but doesn't act on it by default (writing to the clipboard is left to the embedder) —
+    // without this handler those "press c to copy" prompts print success but never copy.
+    term.parser.registerOscHandler(52, (data) => {
+      const payload = data.split(";")[1];
+      if (!payload) return true;
+      try {
+        const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+        navigator.clipboard.writeText(new TextDecoder().decode(bytes)).catch(() => {});
+      } catch (_) { /* malformed base64 — ignore */ }
+      return true;
+    });
     const searchAddon = new SearchAddon({ highlightLimit: 2000 });
     term.loadAddon(searchAddon);
     searchAddonRef.current = searchAddon;
     const searchResultsDisposable = searchAddon.onDidChangeResults(({ resultIndex, resultCount }) => {
       setSearchResults({ index: resultIndex, count: resultCount });
     });
+    // Ctrl+click (Cmd+click on macOS) to open links — matches Windows Terminal/VS Code/iTerm.
+    // The addon's default handler opens on any click, which fights click-drag selection over
+    // a URL (e.g. selecting one to copy it would launch a browser instead).
     // Route terminal links through the native system-browser command. The addon's default
     // window.open() handler is unreliable inside a Tauri webview; the Rust command also
     // rejects every scheme except http(s).
     term.loadAddon(new WebLinksAddon((event, url) => {
+      if (!event.ctrlKey && !event.metaKey) return;
       event.preventDefault();
       void invoke("open_url", { url }).catch(() => {});
     }));
@@ -573,6 +617,20 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     term.open(containerRef.current);
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
+
+    // OSC 52 — CLIs (claude/codex login flows, gh, vim, etc.) use this escape sequence to ask
+    // the terminal to put text on the system clipboard. xterm.js parses it but doesn't act on
+    // it by default (writing to the clipboard is left to the embedder) — without this handler
+    // those "press c to copy the link" prompts print success but never copy anything.
+    term.parser.registerOscHandler(52, (data) => {
+      const payload = data.split(";")[1];
+      if (!payload) return true;
+      try {
+        const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+        navigator.clipboard.writeText(new TextDecoder().decode(bytes)).catch(() => {});
+      } catch (_) { /* malformed base64 — ignore */ }
+      return true;
+    });
 
     // WebGL renderer — must be loaded AFTER term.open(), since the addon attaches to the
     // open xterm's DOM. Loading throws if the host can't give us a WebGL context (CI,
@@ -1328,13 +1386,31 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             const action = e.button === 1 ? interactionSettingsRef.current.middleClick : "none";
             if (terminalMouseEventDisposition(e.button, "auxclick", action) !== "pass") { e.preventDefault(); e.stopPropagation(); }
           }}
-          onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_PATH_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
+          onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_PATH_MIME) || e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
           onDrop={(e) => {
-            const p = e.dataTransfer.getData(DRAG_PATH_MIME) || e.dataTransfer.getData("text/plain");
-            if (!p) return;
             e.preventDefault();
             // Quote paths with spaces (common on Windows); trailing space lets the user keep typing.
-            invoke("write_terminal", { id: tab.id, data: /\s/.test(p) ? `"${p}" ` : `${p} ` }).catch(() => {});
+            const quote = (p: string) => (/\s/.test(p) ? `"${p}"` : p);
+            if (e.dataTransfer.files.length > 0) {
+              // OS file drop (e.g. an image dragged in from Explorer). WebView2 doesn't expose a
+              // real filesystem path on dropped File objects (that's an Electron-only patch, not
+              // a web standard), so we save the bytes to a real temp file and paste that path —
+              // same trick as the clipboard-image paste above. Only images: for any other file
+              // type this would silently paste the path of a *copy*, and an agent editing that
+              // copy would never touch the file the user actually meant to hand it.
+              const images = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/") && f.size <= MAX_DROPPED_FILE_BYTES);
+              if (images.length === 0) return;
+              Promise.all(images.map(async (f) => {
+                return invoke<string>("save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
+              })).then((paths) => {
+                invoke("write_terminal", { id: tab.id, data: paths.map(quote).join(" ") + " " }).catch(() => {});
+                terminalRef.current?.focus();
+              }).catch(() => {});
+              return;
+            }
+            const p = e.dataTransfer.getData(DRAG_PATH_MIME) || e.dataTransfer.getData("text/plain");
+            if (!p) return;
+            invoke("write_terminal", { id: tab.id, data: `${quote(p)} ` }).catch(() => {});
             terminalRef.current?.focus();
           }}
         >
