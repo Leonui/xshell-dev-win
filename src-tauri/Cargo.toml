@@ -27,10 +27,6 @@ uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
 
-[dev-dependencies]
-base64 = "0.22"
-minisign-verify = "0.2.5"
-
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 

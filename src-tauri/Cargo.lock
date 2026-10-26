@@ -5908,10 +5908,8 @@ dependencies = [
 name = "xshell"
 version = "1.6.0"
 dependencies = [
- "base64 0.22.1",
  "dirs",
  "md5",
- "minisign-verify",
  "portable-pty",
  "rusqlite",
  "serde",

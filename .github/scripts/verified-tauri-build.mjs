@@ -4,8 +4,11 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const tauriManifest = join(repoRoot, "src-tauri", "Cargo.toml");
-const verifier = "verify_updater_signature";
+// Deliberately a separate crate: as an example of the app package it would pull in (and, under
+// LTO, link) the whole app library on every job just to read a couple of files.
+const verifierManifest = join(
+  repoRoot, ".github", "scripts", "verify-updater-signature", "Cargo.toml",
+);
 
 function fail(message) {
   console.error(message);
@@ -39,7 +42,7 @@ function configuredPublicKey() {
   return key;
 }
 
-function verifySignatures(releaseRoot, target, profile = "release") {
+function verifySignatures(releaseRoot) {
   if (!existsSync(releaseRoot)) fail(`Tauri release output does not exist: ${releaseRoot}`);
   const signatures = collectFiles(releaseRoot, path => path.endsWith(".sig"));
   if (signatures.length === 0) fail(`No updater signatures were generated under ${releaseRoot}`);
@@ -57,16 +60,9 @@ function verifySignatures(releaseRoot, target, profile = "release") {
   for (const signature of signatures) {
     const artifact = signature.slice(0, -4);
     if (!existsSync(artifact)) fail(`Signature has no paired artifact: ${signature}`);
-    // Build the verifier in the same profile and for the same target as the app. An example in
-    // the default dev profile also compiles the package library and every dependency, which
-    // costs minutes per release job for a few seconds of signature checking; the release
-    // artifacts were just produced by the build, so this reuses them.
-    const verifierArgs = ["run", "--quiet"];
-    if (profile === "release") verifierArgs.push("--release");
-    verifierArgs.push("--manifest-path", tauriManifest, "--example", verifier);
-    if (target) verifierArgs.push("--target", target);
-    verifierArgs.push("--", publicKey, artifact, signature);
-    run("cargo", verifierArgs);
+    run("cargo", [
+      "run", "--quiet", "--manifest-path", verifierManifest, "--", publicKey, artifact, signature,
+    ]);
   }
   console.log(`Cryptographically verified ${signatures.length} updater signature(s).`);
 }
@@ -90,9 +86,4 @@ const profile = args.includes("--debug") ? "debug" : "release";
 const releaseRoot = target
   ? join(repoRoot, "src-tauri", "target", target, profile)
   : join(repoRoot, "src-tauri", "target", profile);
-// `universal-apple-darwin` is a Tauri-level merge of both slices; point the verifier at the
-// host slice so it reuses the release artifacts the build just produced.
-const verifyTarget = target === "universal-apple-darwin"
-  ? (process.arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin")
-  : target;
-verifySignatures(releaseRoot, verifyTarget, profile);
+verifySignatures(releaseRoot);
