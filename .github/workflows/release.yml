@@ -101,7 +101,9 @@ jobs:
           tauriScript: npm run tauri:verified
           # A `-verify` tag runs the full three-platform build without creating or updating a
           # release: tauri-action publishes whenever tagName is set, so leave it unset there.
-          tagName: ${{ endsWith(github.ref_name, '-verify') && '' || 'v__VERSION__' }}
+          # tauri-action publishes whenever tagName is set; an empty string is falsy in Actions
+          # expressions, so negate the check instead of using `cond && '' || value`.
+          tagName: ${{ !endsWith(github.ref_name, '-verify') && 'v__VERSION__' || '' }}
           releaseName: 'xshell v__VERSION__'
           releaseBody: |
             See the assets below to download and install this version.
