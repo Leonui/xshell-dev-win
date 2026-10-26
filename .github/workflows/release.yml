@@ -99,10 +99,9 @@ jobs:
         with:
           # The wrapper verifies the exact updater artifacts before tauri-action can upload them.
           tauriScript: npm run tauri:verified
-          # A `-verify` tag runs the full three-platform build without creating or updating a
-          # release: tauri-action publishes whenever tagName is set, so leave it unset there.
-          # tauri-action publishes whenever tagName is set; an empty string is falsy in Actions
-          # expressions, so negate the check instead of using `cond && '' || value`.
+          # A `-verify` tag builds all three platforms without creating or updating a release.
+          # An empty tagName disables publishing, and `''` is falsy in Actions expressions, so
+          # negate the check rather than using `cond && '' || value`.
           tagName: ${{ !endsWith(github.ref_name, '-verify') && 'v__VERSION__' || '' }}
           releaseName: 'xshell v__VERSION__'
           releaseBody: |

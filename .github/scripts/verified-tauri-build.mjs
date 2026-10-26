@@ -39,7 +39,7 @@ function configuredPublicKey() {
   return key;
 }
 
-function verifySignatures(releaseRoot) {
+function verifySignatures(releaseRoot, target, profile = "release") {
   if (!existsSync(releaseRoot)) fail(`Tauri release output does not exist: ${releaseRoot}`);
   const signatures = collectFiles(releaseRoot, path => path.endsWith(".sig"));
   if (signatures.length === 0) fail(`No updater signatures were generated under ${releaseRoot}`);
@@ -57,10 +57,16 @@ function verifySignatures(releaseRoot) {
   for (const signature of signatures) {
     const artifact = signature.slice(0, -4);
     if (!existsSync(artifact)) fail(`Signature has no paired artifact: ${signature}`);
-    run("cargo", [
-      "run", "--quiet", "--manifest-path", tauriManifest,
-      "--example", verifier, "--", publicKey, artifact, signature,
-    ]);
+    // Build the verifier in the same profile and for the same target as the app. An example in
+    // the default dev profile also compiles the package library and every dependency, which
+    // costs minutes per release job for a few seconds of signature checking; the release
+    // artifacts were just produced by the build, so this reuses them.
+    const verifierArgs = ["run", "--quiet"];
+    if (profile === "release") verifierArgs.push("--release");
+    verifierArgs.push("--manifest-path", tauriManifest, "--example", verifier);
+    if (target) verifierArgs.push("--target", target);
+    verifierArgs.push("--", publicKey, artifact, signature);
+    run("cargo", verifierArgs);
   }
   console.log(`Cryptographically verified ${signatures.length} updater signature(s).`);
 }
@@ -84,4 +90,9 @@ const profile = args.includes("--debug") ? "debug" : "release";
 const releaseRoot = target
   ? join(repoRoot, "src-tauri", "target", target, profile)
   : join(repoRoot, "src-tauri", "target", profile);
-verifySignatures(releaseRoot);
+// `universal-apple-darwin` is a Tauri-level merge of both slices; point the verifier at the
+// host slice so it reuses the release artifacts the build just produced.
+const verifyTarget = target === "universal-apple-darwin"
+  ? (process.arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin")
+  : target;
+verifySignatures(releaseRoot, verifyTarget, profile);
